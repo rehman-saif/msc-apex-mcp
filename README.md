@@ -1,5 +1,7 @@
 # Apex MCP bridge
 
+Version **1.0.0** (kept in `apex_mcp\version.py`; `apex_status` reports it).
+
 Lets Claude work in **your own open MSC Apex 2024.1 session** for pre-processing:
 inspecting the model, checking CAD, driving the viewport and running Apex Python.
 Generic: nothing here knows about a particular model. Post-processing and .h5

@@ -50,6 +50,7 @@ async def main():
                 return txt
 
             t = await call("apex_status")
+            assert json.loads(t)["version"] == "1.0.0", t
             dep = json.loads(t)["deployment"]  # M9: same folder on both sides, so no warning
             assert dep["bridge_root"] and "warning" not in dep, dep
             t = await call("list_tree")

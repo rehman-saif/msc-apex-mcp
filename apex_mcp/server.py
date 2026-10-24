@@ -32,6 +32,7 @@ except ImportError:  # mcp 1.x
 
 import bdf_summary
 from skills import SKILLS_REPO, ApexScriptingSkill, find_skill
+from version import __version__
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.environ.get("APEX_MCP_CONFIG", os.path.join(ROOT, "config.json"))
@@ -214,12 +215,13 @@ def deployment_check(res):
 async def _status(connect=True):
     res = await _bridge("status", {"connect": connect})
     res["deployment"] = deployment_check(res)
+    res["version"] = __version__
     return _json(res)
 
 
 @mcp.tool()
 async def apex_status(connect: bool = True) -> str:
-    """Connect to the Claude Bridge in Apex and report Apex release, current model,
+    """Connect to the Claude Bridge in Apex and report this server's version, Apex release, current model,
     unit systems, project folder and the query limits in force. `deployment` compares the
     folder this server runs from with the one the Apex bridge loads its worker and config.json
     from (plus file hashes) and warns when they differ."""
