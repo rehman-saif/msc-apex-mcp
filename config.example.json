@@ -1,0 +1,14 @@
+{
+  "bridge_port": 47115,
+  "bridge_token": "",
+  "script_unit_system": "",
+  "output_dir": "",
+  "screenshot_max_width": 1400,
+  "call_timeout_s": 300,
+  "query_time_budget_s": 20,
+  "max_items": 200,
+  "max_response_kb": 256,
+  "max_highlight_ids": 20000,
+  "skills_dir": "",
+  "require_skill_lookup": true
+}

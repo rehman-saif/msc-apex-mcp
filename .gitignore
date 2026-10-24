@@ -1,0 +1,15 @@
+# environment and per-machine files (setup.bat creates these)
+.venv/
+vendor/
+output/
+config.json
+mcp_config.snippet.json
+codex_config.snippet.toml
+__pycache__/
+*.pyc
+
+# local leftovers
+*.bak
+*_backup_*/
+*_backup_*.md
+_to_delete/
