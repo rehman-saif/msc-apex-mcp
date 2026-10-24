@@ -100,8 +100,8 @@ def bbox(entity):
         return None
 
 
-def _rle(ids):
-    """[3,4,5,9] -> '3-5,9-9' (Apex range string)."""
+def rle(ids):
+    """[3,4,5,9] -> '3-5,9-9' (Apex range string for getElements/getNodes(ids=...))."""
     ids = sorted(set(int(i) for i in ids))
     out, start, prev = [], None, None
     for i in ids:
@@ -115,6 +115,20 @@ def _rle(ids):
     if start is not None:
         out.append("%d-%d" % (start, prev))
     return ",".join(out)
+
+
+_rle = rle  # old private name, kept for scripts that used it
+
+
+def collection(items):
+    """apex.EntityCollection holding items (a plain list outside Apex)."""
+    try:
+        import apex
+        coll = apex.EntityCollection()
+        coll.appendList(list(items))
+        return coll
+    except ImportError:
+        return list(items)
 
 
 # Apex 2024.1 does not expose apex.geometry.GeometryFaultType; order as documented.
@@ -182,7 +196,7 @@ def element_ids_flat(mesh):
 
 def get_elements_by_ids(mesh, id_list):
     """ElementCollection for a short list of element IDs of one mesh."""
-    s = _rle(id_list)
+    s = rle(id_list)
     for call in (lambda: mesh.getElements(ids=s),
                  lambda: mesh.getElements(ids=s, indices=""),
                  lambda: mesh.getElements(ids=s, indices=None)):
@@ -257,8 +271,203 @@ def node_bbox_numpy(mesh):
         return {"min": [min(xs), min(ys), min(zs)], "max": [max(xs), max(ys), max(zs)]}
 
 
+# ------------------------------------------------------------------ nodes
+def meshes_of(entity):
+    """The MeshBodies of a part (or [entity] if it already is a mesh)."""
+    if hasattr(entity, "getMeshes"):
+        return list(safe(lambda: entity.getMeshes()) or [])
+    return [entity]
+
+
+def node_arrays(mesh):
+    """(ids, xyz) numpy arrays of one mesh, from the bulk arrays."""
+    import numpy as np
+    ids = np.asarray(list(mesh.getNodeIDs() or []), dtype=np.int64)
+    xyz = np.asarray(list(mesh.getNodeCoordinates() or []), dtype=float).reshape(-1, 3)
+    return ids, xyz
+
+
+def nodes_where(entity, fn, ids_only=False):
+    """Nodes of a mesh (or of every mesh of a part) where fn(xyz) is True. fn gets an (N,3)
+    numpy array and returns a bool mask, e.g. a bolt-hole wall:
+        Q.nodes_where(mesh, lambda p: abs(np.hypot(p[:,0]-x, p[:,1]-y) - r) < 0.05)
+    Returns an EntityCollection of Nodes, or sorted node IDs with ids_only=True."""
+    import numpy as np
+    ids_out, nodes = [], []
+    for m in meshes_of(entity):
+        ids, xyz = node_arrays(m)
+        if not len(ids):
+            continue
+        sel = ids[np.asarray(fn(xyz), dtype=bool)]
+        if not len(sel):
+            continue
+        ids_out.extend(int(i) for i in sel)
+        if not ids_only:
+            nodes.extend(list(m.getNodes(ids=rle(sel))))
+    return sorted(ids_out) if ids_only else collection(nodes)
+
+
+def nodes_by_id(entity, ids):
+    """EntityCollection of the Nodes with these IDs in a part's meshes. KeyError if any is missing."""
+    want = set(int(i) for i in ids)
+    found, nodes = set(), []
+    for m in meshes_of(entity):
+        have = want.intersection(int(i) for i in (m.getNodeIDs() or []))
+        if have:
+            found |= have
+            nodes.extend(list(m.getNodes(ids=rle(have))))
+    if found != want:
+        raise KeyError("node ids not in %s: %s" % (name_of(entity), sorted(want - found)[:20]))
+    return collection(nodes)
+
+
+def node_near(entity, xyz, tol=0.01):
+    """The Node of a part's meshes nearest to xyz if it lies within tol, else None."""
+    import numpy as np
+    best = None
+    for m in meshes_of(entity):
+        ids, pts = node_arrays(m)
+        if not len(ids):
+            continue
+        d = np.linalg.norm(pts - np.asarray(xyz, dtype=float), axis=1)
+        i = int(np.argmin(d))
+        if d[i] <= tol and (best is None or d[i] < best[0]):
+            best = (float(d[i]), m, int(ids[i]))
+    return best[1].getNode(id=best[2]) if best else None
+
+
+def nodes_on_face(faces, ids_only=False):
+    """Mesh nodes associated with one Face or several (Face.getNodes, de-duplicated)."""
+    if hasattr(faces, "getNodes"):
+        faces = [faces]
+    seen, nodes = set(), []
+    for f in faces:
+        for n in f.getNodes():
+            i = int(n.id)
+            if i not in seen:
+                seen.add(i)
+                nodes.append(n)
+    return sorted(seen) if ids_only else collection(nodes)
+
+
+# ------------------------------------------------------------------ faces
+def bodies_of(entity):
+    """Solids and surfaces of a part, or [entity] for a single body."""
+    if hasattr(entity, "getSolids"):
+        return list(safe(lambda: entity.getSolids()) or []) + list(safe(lambda: entity.getSurfaces()) or [])
+    return [entity]
+
+
+def faces_by_id(entity, ids):
+    """EntityCollection of the Faces with these IDs on a part's (or one body's) solids and
+    surfaces, in the order given. KeyError if any is missing."""
+    want = [int(i) for i in ids]
+    found = {}
+    for body in bodies_of(entity):
+        for f in safe(lambda: body.getFaces()) or []:
+            i = safe(lambda: int(f.id))
+            if i in want:
+                found[i] = f
+    missing = [i for i in want if i not in found]
+    if missing:
+        raise KeyError("face ids not in %s: %s (use list_faces)" % (name_of(entity), missing[:20]))
+    return collection([found[i] for i in want])
+
+
+def _vec(v):
+    try:
+        return [float(v.x), float(v.y), float(v.z)]
+    except Exception:
+        return None
+
+
+def _unit(v):
+    n = math.sqrt(sum(c * c for c in v)) if v else 0.0
+    return [c / n for c in v] if n > 0 else None
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _uv_range(face):
+    pr = safe(lambda: face.getParametricRange()) or safe(lambda: face.parametricRange) or {}
+    r = {}
+    for k, v in (safe(lambda: dict(pr).items()) or []):
+        k = str(k).lower()
+        side = "lo" if ("start" in k or "min" in k) else "hi" if ("end" in k or "max" in k) else None
+        if side and k[:1] in "uv":
+            r[k[0] + side] = float(v)
+    return r if len(r) == 4 else None
+
+
+def face_shape(face):
+    """('plane', normal, None) | ('cyl', axis, radius) | ('curved', None, None) | ('?', None, None).
+    Classified from normals sampled over the face's parametric range: Apex reports a
+    cylindricalAxis for every face, so that alone does not say the face is a cylinder."""
+    r = _uv_range(face)
+    if r is None:
+        return "?", None, None
+    uv = [(r["ulo"] + a * (r["uhi"] - r["ulo"]), r["vlo"] + b * (r["vhi"] - r["vlo"]))
+          for a, b in ((0.5, 0.5), (0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8))]
+    normals = [_unit(_vec(safe(lambda u=u, v=v: face.evaluateNormal(u=u, v=v)))) for u, v in uv]
+    if any(n is None for n in normals):
+        return "?", None, None
+    if all(abs(_dot(normals[0], n)) > 0.9999 for n in normals):
+        return "plane", normals[0], None
+    axis = _unit(_vec(safe(lambda: face.getCylindricalAxis())))
+    mid = _vec(safe(lambda: face.getCylindricalAxisMidPoint()))
+    if axis and mid and all(abs(_dot(axis, n)) < 1e-3 for n in normals):
+        radii = []
+        for u, v in uv:
+            p = _vec(safe(lambda u=u, v=v: face.evaluateFaceParametricCoordinate(u=u, v=v)))
+            if p is None:
+                break
+            d = [pc - mc for pc, mc in zip(p, mid)]
+            t = _dot(d, axis)
+            radii.append(math.sqrt(max(0.0, _dot(d, d) - t * t)))
+        if len(radii) == len(uv) and max(radii) - min(radii) <= 1e-3 * max(1.0, max(radii)):
+            return "cyl", axis, sum(radii) / len(radii)
+    return "curved", None, None
+
+
+FACE_COLS = ["id", "kind", "area", "centroid", "dir", "r"]
+
+
+def face_rows(entity, kind=None, near=None, radius=None, normal=None, angle_tol=5.0,
+              limit=MAX_ITEMS, budget=None):
+    """Compact rows (FACE_COLS) for the faces of a part's bodies that pass the filters.
+    dir is the plane normal or cylinder axis; r the cylinder radius. near+radius keeps faces
+    whose centroid lies within radius of near; normal keeps faces whose dir is within
+    angle_tol degrees of it (either sense). Returns (rows, faces_scanned, faces_matched)."""
+    want_n = _unit([float(c) for c in normal]) if normal else None
+    cos_tol = math.cos(math.radians(float(angle_tol)))
+    rows, scanned, matched = [], 0, 0
+    for body in bodies_of(entity):
+        for f in safe(lambda: body.getFaces()) or []:
+            if budget is not None and budget.over():
+                return rows, scanned, matched
+            scanned += 1
+            c = _vec(safe(lambda: f.centroid)) or _vec(safe(lambda: f.getCentroid()))
+            if near is not None and (c is None or math.dist(c, near) > float(radius)):
+                continue
+            shape, d, r = face_shape(f) if (kind or want_n or len(rows) < limit) else ("?", None, None)
+            if kind and shape != kind:
+                continue
+            if want_n and (d is None or abs(_dot(d, want_n)) < cos_tol):
+                continue
+            matched += 1
+            if len(rows) < limit:
+                a = safe(lambda: float(f.area))
+                rows.append([safe(lambda: int(f.id)), shape, round(a, 4) if a is not None else None,
+                             [round(x, 3) for x in c] if c else None,
+                             [round(x, 4) for x in d] if d else None,
+                             round(r, 4) if r is not None else None])
+    return rows, scanned, matched
+
+
 # ------------------------------------------------------------------ geometry
-def solid_summary(solid, budget=None, edge_stats=True):
+def solid_summary(solid, budget=None, edge_stats=True, with_bbox=True):
     rec = {"name": name_of(solid), "id": safe(lambda: int(solid.id))}
     v = safe(lambda: float(solid.getVolume()))
     if v is None:
@@ -273,7 +482,8 @@ def solid_summary(solid, budget=None, edge_stats=True):
         rec.update(edge_length_stats(edges, budget))
     if faces is not None:
         rec.update(face_area_stats(faces, budget))
-    rec["bbox"] = bbox(solid)
+    if with_bbox:
+        rec["bbox"] = bbox(solid)
     return rec
 
 
@@ -349,7 +559,8 @@ def part_summary(part, sample=3, geometry=True, budget_s=20.0, max_items=MAX_ITE
             if i >= max_items or b.over():
                 rec["solids_truncated"] = True
                 break
-            rec["solids"].append(solid_summary(s, b, edge_stats=False))
+            # per-solid bbox left out: it nearly always repeats the part bbox
+            rec["solids"].append(solid_summary(s, b, edge_stats=False, with_bbox=False))
         for i, s in enumerate(srf):
             if i >= max_items or b.over():
                 rec["surfaces_truncated"] = True

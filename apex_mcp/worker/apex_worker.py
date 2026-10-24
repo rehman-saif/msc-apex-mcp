@@ -17,19 +17,42 @@ Apex down. So:
 """
 import contextlib
 import datetime
+import hashlib
 import io
 import json
+import linecache
 import os
 import sys
 import time
 import traceback
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))  # the Apex_MCP folder this bridge runs from
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import builders as B  # noqa: E402
 import queries as Q  # noqa: E402
 import serialize as S  # noqa: E402
+
+# Files whose copies must match between the MCP server and the bridge (apex_status compares them).
+DEPLOYED_FILES = ["apex_mcp/worker/apex_worker.py", "apex_mcp/worker/queries.py",
+                  "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py",
+                  "apex_palette/Claude/Bridge/Claude Bridge/src/claude_bridge_worker.py",
+                  "apex_palette/Claude/Bridge/Claude Bridge/src/claude_bridge_ui.py"]
+
+
+def file_hashes(root, rels=DEPLOYED_FILES):
+    """{relative path: first 12 hex chars of sha256, or None if missing}."""
+    out = {}
+    for rel in rels:
+        try:
+            with open(os.path.join(root, *rel.split("/")), "rb") as fh:
+                out[rel] = hashlib.sha256(fh.read()).hexdigest()[:12]
+        except OSError:
+            out[rel] = None
+    return out
 
 CFG = {}
 MODE = {"inprocess": False, "log_file": None}
@@ -149,7 +172,9 @@ def parts_from(paths):
 def m_status(p):
     out = {"worker_python": sys.version.split()[0], "attached": STATE["attached"],
            "limits": {k: cfg(k) for k in DEFAULTS},
-           "config": {k: v for k, v in CFG.items() if "token" not in k}}
+           "config": {k: v for k, v in CFG.items() if "token" not in k},
+           "deployment": {"root": ROOT, "config_path": os.path.join(ROOT, "config.json"),
+                          "hashes": file_hashes(ROOT)}}
     if p.get("connect", True):
         apex = ensure_apex()
         out["attached"], out["pid"] = True, STATE["pid"]
@@ -284,6 +309,32 @@ def m_get_entity(p):
     return rec
 
 
+def m_list_faces(p):
+    """Compact face rows (id, kind, area, centroid, dir, r) per part, filtered."""
+    ensure_apex()
+    kind = p.get("kind")
+    if kind not in (None, "plane", "cyl", "curved"):
+        raise ValueError("kind must be plane, cyl or curved")
+    near = p.get("near")
+    if near is not None and p.get("radius") is None:
+        raise ValueError("near needs radius")
+    b = Q.Budget(cfg("query_time_budget_s"))
+    left = limit_of(p)
+    out = {"cols": Q.FACE_COLS, "parts": []}
+    for part in parts_from(p.get("paths")):
+        rows, scanned, matched = Q.face_rows(
+            part, kind=kind, near=near, radius=p.get("radius"), normal=p.get("normal"),
+            angle_tol=float(p.get("angle_tol", 5.0)), limit=left, budget=b)
+        left -= len(rows)
+        rec = {"path": Q.safe(lambda: part.pathName), "scanned": scanned, "matched": matched, "rows": rows}
+        out["parts"].append(rec)
+        if b.hit:
+            break
+    if b.hit:
+        out["budget_exceeded"] = "narrow with paths, near/radius or kind"
+    return out
+
+
 _CONN_GETTERS = ["getFasteners", "getBolt3Ds", "getRigidLinks", "getBushings", "getConnectors",
                  "getConnectorDiscretes", "getNodeTies", "getDiscreteTies",
                  "getMeshDependentTies", "getInteractions", "getPointMasses"]
@@ -368,7 +419,7 @@ def m_list_loads_constraints(p):
     res = {}
     for key, fn in (("loads", apex.environment.getLoads), ("constraints", apex.environment.getConstraints)):
         try:
-            coll = fn()
+            coll = fn() or []
             res[key + "_count"] = Q.clen(coll)
             res[key] = [S.ref(x) for i, x in enumerate(coll) if i < cap]
         except Exception as exc:
@@ -388,7 +439,7 @@ def m_list_catalog(p):
                     ("layered_panels", lambda: apex.attribute.getLayeredPanels(
                         target=[{"path": apex.currentModel().pathName}]))):
         try:
-            coll = fn()
+            coll = fn() or []
             out[key] = {"count": Q.clen(coll),
                         "names": [Q.name_of(x) for i, x in enumerate(coll) if i < cap]}
         except Exception as exc:
@@ -398,12 +449,14 @@ def m_list_catalog(p):
 
 def m_list_scenarios(p):
     apex = ensure_apex()
-    study = apex.getPrimaryStudy()
+    study = Q.safe(apex.getPrimaryStudy)
+    if study is None:
+        return {"study": None, "scenarios": []}
     out = {"study": S.ref(study), "scenarios": []}
     for kind, getter in (("Scenario", lambda: study.getScenarios(recursive=True)),
                          ("ScenarioNastran", lambda: study.getScenariosNastran())):
         try:
-            for scn in getter():
+            for scn in getter() or []:  # an empty study returns None, not an empty collection
                 rec = S.ref(scn)
                 rec["kind"] = kind
                 for attr in ("executionStatus", "solutionType"):
@@ -428,6 +481,42 @@ def m_import_fe_model(p):
         kw["organizeBy"] = enum(apex.mesh.FEModelImportOrganizationOptions, p["organize_by"], "organize_by")
     ent = model.importFEModel(**kw)
     return {"created": S.ref(ent)}
+
+
+def nastran_scenarios(study):
+    return list(Q.safe(lambda: study.getScenariosNastran()) or [])
+
+
+def m_export_bdf(p):
+    """Write the Nastran deck of a Nastran scenario (the only one, or p['scenario']); with
+    no scenario in the study, write the model's bulk data. The server summarises the file."""
+    apex = ensure_apex()
+    study = Q.safe(apex.getPrimaryStudy)
+    scns = nastran_scenarios(study) if study is not None else []
+    name = p.get("scenario")
+    if name:
+        scn = next((s for s in scns if Q.name_of(s) == name), None)
+        if scn is None:
+            raise KeyError("no Nastran scenario '%s'. Have: %s" % (name, [Q.name_of(s) for s in scns]))
+    elif len(scns) > 1:
+        raise ValueError("several Nastran scenarios, pass scenario=: %s" % [Q.name_of(s) for s in scns])
+    else:
+        scn = scns[0] if scns else None
+    stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in (Q.name_of(scn) if scn else "model"))
+    path = p.get("path") or os.path.join(out_dir("bdf"), stem + ".bdf")
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    units = p.get("unit_system") or CFG.get("script_unit_system") or apex.getScriptUnitSystemLabel()
+    kw = {"filename": path, "unitSystem": units}
+    if scn is not None and p.get("hdf5", True):
+        kw["resultOutputType"] = apex.attribute.NastranResultOutputType.Hdf5
+    t0 = time.time()
+    (scn if scn is not None else apex.currentModel()).exportFEModel(**kw)
+    out = {"path": path, "scenario": Q.name_of(scn) if scn else None, "unit_system": units,
+           "bytes": os.path.getsize(path), "seconds": round(time.time() - t0, 2)}
+    if scn is None:
+        out["note"] = "no Nastran scenario in the study: bulk data only, no case control"
+    return out
 
 
 # ------------------------------------------------------------- viewport
@@ -534,7 +623,7 @@ def m_highlight(p):
         if len(ids) > cap:
             raise ValueError("%d ids requested; max_highlight_ids is %d" % (len(ids), cap))
         coll = apex.get(target=[{"type": p.get("kind", "Element"), "path": p["part_path"],
-                                 "ids": Q._rle(ids)}])
+                                 "ids": Q.rle(ids)}])
     else:
         coll = entities_by_path(p["paths"])
     n = 0
@@ -606,29 +695,60 @@ def m_screenshot(p):
 
 
 # ----------------------------------------------------------------- raw
+SCRIPT = "<script>"  # filename scripts are compiled under; their traceback frames show this
+
+
+def _inject(ns, name, mod):
+    """Put a helper module in the script namespace unless the script bound that name itself
+    (a reloaded copy of the same module still counts as ours)."""
+    cur = ns.get(name)
+    if cur is None or (isinstance(cur, types.ModuleType) and cur.__name__ == mod.__name__):
+        ns[name] = mod
+
+
+def script_traceback(exc):
+    """Traceback limited to the user's script frames plus the exception line: the worker's
+    exec frame and Apex's internal (smodules) frames say nothing about the script."""
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == SCRIPT]
+    lines = (["Traceback (script frames):\n"] + traceback.format_list(frames)) if frames else []
+    return "".join(lines + traceback.format_exception_only(type(exc), exc))
+
+
 def m_run_apex_python(p):
     if STATE["ns"] is None:
         STATE["ns"] = {"__name__": "__claude__"}
     ns = STATE["ns"]
-    ns["Q"], ns["S"] = Q, S
+    _inject(ns, "Q", Q)
+    _inject(ns, "S", S)
     if p.get("attach", True):
         ns["apex"] = ensure_apex()
     code = p["code"]
     log_path = os.path.join(out_dir("scripts"), "script_%s.py" % stamp())
     with open(log_path, "w", encoding="utf-8") as fh:
         fh.write("# run_apex_python %s\n%s\n" % (datetime.datetime.now().isoformat(), code))
+    # source for the traceback lines (mtime None: linecache.checkcache leaves it alone)
+    linecache.cache[SCRIPT] = (len(code), None, code.splitlines(True), SCRIPT)
     ns.pop("result", None)
     buf = io.StringIO()
     err = None
     t0 = time.time()
     with contextlib.redirect_stdout(buf):
         try:
-            exec(compile(code, log_path, "exec"), ns)  # noqa: S102 - the user asked for a raw tool
-        except Exception:
-            err = traceback.format_exc()
+            exec(compile(code, SCRIPT, "exec"), ns)  # noqa: S102 - the user asked for a raw tool
+        except Exception as exc:
+            err = script_traceback(exc)
     out = {"stdout": buf.getvalue()[-20000:], "seconds": round(time.time() - t0, 3), "logged_to": log_path}
     if "result" in ns:
-        out["result"] = S.to_json(ns["result"], depth=4)
+        res = S.to_json(ns["result"], depth=4)
+        size_kb = len(json.dumps(res, default=str)) / 1024.0
+        room_kb = float(cfg("max_response_kb")) - len(out["stdout"]) / 1024.0 - 4  # stdout still fits
+        if size_kb > room_kb:
+            out["result_error"] = ("result too large (%.0f kB, max_response_kb %.0f): aggregate in the "
+                                   "script and return counts / min / max / top-N"
+                                   % (size_kb, float(cfg("max_response_kb"))))
+            out["result_preview"] = json.dumps(res, default=str)[:2000]
+        else:
+            out["result"] = res
     if err:
         out["traceback"] = err[-8000:]
     with open(log_path, "a", encoding="utf-8") as fh:
@@ -637,6 +757,7 @@ def m_run_apex_python(p):
 
 
 METHODS = {name[2:]: fn for name, fn in globals().items() if name.startswith("m_") and callable(fn)}
+METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in B.TOOLS.items()})
 
 
 def handle_request(req):

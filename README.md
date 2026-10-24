@@ -1,5 +1,7 @@
 # Apex MCP bridge
 
+Version **1.0.0** (kept in `apex_mcp\version.py`; `apex_status` reports it).
+
 Lets Claude work in **your own open MSC Apex 2024.1 session** for pre-processing:
 inspecting the model, checking CAD, driving the viewport and running Apex Python.
 Generic: nothing here knows about a particular model. Post-processing and .h5
@@ -42,10 +44,15 @@ Re-run `setup.bat` to update the skills.
 ## Daily use
 
 Open Apex and your model, open **Claude Bridge** and press **Start**. Press **Stop** when done.
-Edits to `apex_worker.py`, `queries.py` or `serialize.py` are picked up on the next call
-without restarting Apex. The bridge calls `apex.disableShowOutput()` on every call, so Apex's
+Edits to `apex_worker.py`, `builders.py`, `queries.py` or `serialize.py` are picked up on the
+next call without restarting Apex. The bridge calls `apex.disableShowOutput()` on every call, so Apex's
 script-output dialog no longer opens and blocks the next call. Edits to `server.py` or
 `skills.py` need the MCP client restarted.
+
+Apex must load the bridge from **this** folder. If Apex's Custom Tools entry points at another
+copy of Apex_MCP, the server and the bridge drift apart and edits never reach Apex.
+`apex_status` reports both folders (`deployment.server_root` / `bridge_root`), compares the
+worker and palette files by hash, and warns when they differ.
 
 ## Memory safety (why the query tools were rewritten)
 
@@ -65,15 +72,19 @@ calls queued up behind it. Now:
   with "Apex is busy", instead of queueing.
 - `run_apex_python` has the same rules in its description, and the `Q` helper module is
   preloaded (`Q.part_summary`, `Q.mesh_summary`, `Q.sample_elements`, `Q.topology_counts`,
-  `Q.solid_summary`, `Q.surface_summary`, `Q.bbox`, `Q.Budget`).
+  `Q.solid_summary`, `Q.surface_summary`, `Q.bbox`, `Q.Budget`, `Q.faces_by_id`,
+  `Q.nodes_on_face`, `Q.nodes_where`, `Q.nodes_by_id`, `Q.node_near`, `Q.rle`). A script that
+  binds `Q` or `S` itself keeps its value; `import queries as Q` brings the helpers back.
 
-## Tools (22)
+## Tools (33)
 
 | Group | Tools |
 |---|---|
 | Session | `apex_status`, `reconnect` |
-| Model (read-only) | `list_tree`, `part_summary`, `geometry_check`, `get_entity`, `find_entities`, `list_connections`, `list_loads_constraints`, `list_catalog`, `list_scenarios` |
+| Model (read-only) | `list_tree`, `part_summary`, `geometry_check`, `get_entity`, `find_entities`, `list_faces`, `list_connections`, `list_loads_constraints`, `list_catalog`, `list_scenarios` |
 | Model (changes it) | `import_fe_model` |
+| Builders (change it) | `create_material`, `assign_solid_property`, `mesh_solid`, `glue`, `rbe2`, `beam`, `constrain`, `nodal_load`, `static_scenario` |
+| Deck | `export_bdf` |
 | Viewport | `visibility`, `set_view`, `display_options`, `highlight`, `annotate`, `cut_view`, `screenshot` |
 | Apex API (local, read-only) | `apex_api_lookup`, `apex_scripting_guide` |
 | Raw | `run_apex_python` |
@@ -84,6 +95,23 @@ calls queued up behind it. Now:
 - `geometry_check`: Apex `findGeometryFaults` (Sliver, SmallEdge, SmallFace, Overhang, Gap,
   Crack, Spike) and `findFixSmallSurfaceAndCurveFeatures` with `autoFix=False`, plus
   edge-length and face-area ranges per body. It repairs nothing.
+- `list_faces`: one compact row per face, `[id, kind, area, centroid, dir, r]`, where kind is
+  plane, cyl or curved, dir is the normal or axis, and r is the cylinder radius. Filters are
+  `kind`, `near`+`radius` and `normal`. The ids go into builder targets.
+- Builders wrap the Apex calls proven in real sessions. Each one returns ids and counts only,
+  and each is idempotent: a repeat call with the same name (for `rbe2`, the same reference node)
+  replaces what the earlier call made. `mesh_solid` deletes the old mesh on those solids first.
+  `constrain` and `nodal_load` keep their SPC/LOAD set id when re-created, so scenarios still
+  point at them. `beam` returns the mesh node at each input point, ready to use as an `rbe2` ref.
+  `static_scenario` reads LOAD/SPC/BCONTACT back after setting them. Targets are a pathName,
+  `{"path": part, "faces": [ids]}`, `{"path": part, "nodes": [ids]}`, or a list of these.
+- `export_bdf`: writes the scenario's deck, then reads it in the MCP server (not in Apex) and
+  returns only SOL, case control, card counts and lint warnings. The lint covers contact cards
+  without a matching BCONTACT, subcases without LOAD/SPC or pointing at missing sets, RBE2
+  dependent nodes that are SPC'd or in two RBE2s, missing property/material/GRID references,
+  and duplicate ids. `python apex_mcp\bdf_summary.py deck.bdf` runs the same check on any deck.
+- `run_apex_python` returns plain text: stdout, then `result=<compact JSON>`, then on failure the
+  script's own traceback frames and where the script was saved.
 
 ## Apex API grounding
 
@@ -105,8 +133,8 @@ Apex GUI docs, Nastran reference, Nastran diagnostics and modelling strategy.
 ## Safety
 
 - The bridge listens on 127.0.0.1 only, and every connection must present `bridge_token`.
-- Only `import_fe_model` and `run_apex_python` can change the model. Every raw script is
-  saved to `output\scripts\`.
+- Only `import_fe_model`, the builder tools and `run_apex_python` can change the model. Every raw
+  script is saved to `output\scripts\`.
 - Logs: `output\bridge\bridge_ui.log` (listener) and `output\bridge\bridge_worker.log` (calls).
 
 ## Config (`config.json`)
@@ -115,7 +143,7 @@ Apex GUI docs, Nastran reference, Nastran diagnostics and modelling strategy.
 |---|---|
 | `bridge_port` / `bridge_token` | where the Apex tool listens, and the shared secret |
 | `script_unit_system` | e.g. `mm-kg-s-N`; empty leaves Apex's script units alone |
-| `output_dir` | screenshots, scripts, logs |
+| `output_dir` | screenshots, scripts, exported decks (`bdf\`), logs |
 | `call_timeout_s` | maximum seconds the server waits for one Apex call |
 | `query_time_budget_s` | wall-clock budget for entity loops inside one query (default 20) |
 | `max_items` | default cap on listed items per query (default 200) |
@@ -128,7 +156,8 @@ Apex GUI docs, Nastran reference, Nastran diagnostics and modelling strategy.
 
 ## Developing
 
-From `.venv`, run `python tests\test_end_to_end.py` (needs the skills in `vendor\`, or
+From `.venv`, run `python tests\test_units.py` (BDF lint, deployment check, output format) and
+`python tests\test_end_to_end.py` (needs the skills in `vendor\`, or
 `APEX_SKILLS_DIR`; the `screenshot` step needs Pillow, which Apex ships but the venv does not). This runs the whole chain (MCP client →
 server → bridge UI code → worker) against a fake `apex`. Its `part.elements`/`mesh.elements`
 raise if touched, so the test fails if any tool walks elements.
