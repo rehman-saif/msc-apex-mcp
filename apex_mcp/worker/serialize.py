@@ -36,8 +36,10 @@ def entity_type(e):
 
 
 def ref(e):
-    """Short reference to an entity: name, path, type, id."""
-    out = {"type": entity_type(e), "class": type(e).__name__}
+    """Short reference to an entity: name, path, type, id (and class when it differs from type)."""
+    out = {"type": entity_type(e)}
+    if type(e).__name__ != out["type"]:
+        out["class"] = type(e).__name__
     for key, attr in (("name", "name"), ("path", "pathName"), ("id", "id")):
         try:
             val = getattr(e, attr)

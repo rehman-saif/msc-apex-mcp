@@ -17,7 +17,7 @@ import socket
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import anyio
 
@@ -30,10 +30,13 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
 
+import bdf_summary
 from skills import SKILLS_REPO, ApexScriptingSkill, find_skill
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.environ.get("APEX_MCP_CONFIG", os.path.join(ROOT, "config.json"))
+sys.path.insert(0, os.path.join(ROOT, "apex_mcp", "worker"))
+from apex_worker import file_hashes  # noqa: E402  (pure Python; apex is imported lazily)
 
 NOT_RUNNING = ("Cannot reach the Claude Bridge in Apex on 127.0.0.1:%s. In Apex open the "
                "'Claude' palette -> 'Claude Bridge' and press Start, then retry.")
@@ -128,7 +131,7 @@ class Bridge:
         resp = json.loads(line)
         if not resp.get("ok"):
             raise ToolError("%s\n\nApex-side traceback (last lines):\n%s"
-                            % (resp.get("error"), (resp.get("traceback") or "")[-2500:]))
+                            % (resp.get("error"), (resp.get("traceback") or "")[-1500:]))
         return resp.get("result")
 
 
@@ -143,6 +146,10 @@ mcp = _Server("apex", instructions=(
     "Typical flow: apex_status -> list_tree -> part_summary / geometry_check on the parts of "
     "interest -> list_connections / list_loads_constraints / list_catalog -> viewport tools + "
     "screenshot to look. Entities are addressed by Apex pathName exactly as list_tree returns them. "
+    "To build a model prefer the builder tools (create_material, assign_solid_property, mesh_solid, "
+    "glue, rbe2, beam, constrain, nodal_load, static_scenario; faces by id from list_faces) over "
+    "run_apex_python; they change the model, so confirm with the user first. Check a deck with "
+    "export_bdf, which returns only case control, card counts and lint warnings. "
     "If a tool says the bridge is unreachable, ask the user to press Start in Apex "
     "(Claude palette -> Claude Bridge); if it says Apex is busy, wait instead of resending. "
     "WRITING APEX PYTHON: recalled Apex calls are usually wrong (keyword-only arguments, update() "
@@ -161,25 +168,69 @@ async def _bridge(method, params):
         raise ToolError("%s: %s" % (type(exc).__name__, exc)) from exc
 
 
+def _json(obj):
+    return json.dumps(obj, separators=(",", ":"), default=str)
+
+
 async def _call(method, **params):
     clean = {k: v for k, v in params.items() if v is not None}
-    res = await _bridge(method, clean)
-    return json.dumps(res, indent=1, default=str)
+    return _json(await _bridge(method, clean))
 
 
 # ------------------------------------------------------------------ session
+def _same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def deployment_check(res):
+    """Compare the folder (and file hashes) this server runs from with the one the Apex bridge
+    loaded its worker and config from. They drift apart when Apex's palette points at another
+    copy of Apex_MCP: then edits here never reach Apex."""
+    theirs = res.pop("deployment", None) or {}
+    out = {"server_root": ROOT, "server_config": CONFIG_PATH}
+    if not theirs:
+        out["warning"] = ("the bridge's apex_worker.py does not report its folder, so it is an older copy "
+                          "than this server's. Register %s in Apex (Application Settings -> Custom Tools) "
+                          "and press Stop/Start in Claude Bridge." % os.path.join(ROOT, "apex_palette"))
+        return out
+    out["bridge_root"], out["bridge_config"] = theirs.get("root"), theirs.get("config_path")
+    mine, other = file_hashes(ROOT), theirs.get("hashes") or {}
+    diff = {rel: {"server": h, "bridge": other.get(rel)} for rel, h in mine.items() if h != other.get(rel)}
+    warn = []
+    if not _same_path(out["bridge_root"] or "", ROOT):
+        warn.append("Apex runs the bridge from another folder than this server")
+    elif not _same_path(out["bridge_config"] or "", CONFIG_PATH):
+        warn.append("the bridge reads a different config.json than this server")
+    if diff:
+        out["differing_files"] = diff
+        warn.append("%d file(s) differ between the two copies" % len(diff))
+    if warn:
+        out["warning"] = ("; ".join(warn) + ". Edits on one side do not reach the other. Point Apex's "
+                          "Custom Tools at %s and press Stop/Start in Claude Bridge, or copy the files."
+                          % os.path.join(ROOT, "apex_palette"))
+    return out
+
+
+async def _status(connect=True):
+    res = await _bridge("status", {"connect": connect})
+    res["deployment"] = deployment_check(res)
+    return _json(res)
+
+
 @mcp.tool()
 async def apex_status(connect: bool = True) -> str:
     """Connect to the Claude Bridge in Apex and report Apex release, current model,
-    unit systems, project folder and the query limits in force."""
-    return await _call("status", connect=connect)
+    unit systems, project folder and the query limits in force. `deployment` compares the
+    folder this server runs from with the one the Apex bridge loads its worker and config.json
+    from (plus file hashes) and warns when they differ."""
+    return await _status(connect)
 
 
 @mcp.tool()
 async def reconnect() -> str:
     """Drop and re-open the connection to the Claude Bridge (use after pressing Stop/Start in Apex)."""
     await anyio.to_thread.run_sync(BRIDGE.close)
-    return await _call("status")
+    return await _status()
 
 
 # ------------------------------------------------------------------- model
@@ -221,6 +272,21 @@ async def get_entity(path: str, properties: Optional[list[str]] = None) -> str:
     (e.g. ['material','thickness']; collections come back as counts). For mesh, property and
     material detail of a part use part_summary."""
     return await _call("get_entity", path=path, properties=properties)
+
+
+@mcp.tool()
+async def list_faces(paths: Optional[list[str]] = None, kind: Optional[str] = None,
+                     near: Optional[list[float]] = None, radius: Optional[float] = None,
+                     normal: Optional[list[float]] = None, angle_tol: float = 5.0,
+                     limit: Optional[int] = None) -> str:
+    """Find geometry faces to load, constrain, glue or tie, as compact rows under `cols`:
+    [id, kind, area, centroid, dir, r]. kind is plane | cyl | curved (from sampled normals);
+    dir is the plane normal or cylinder axis, r the cylinder radius. Filters: kind; near=[x,y,z]
+    with radius (centroid within radius); normal=[nx,ny,nz] (dir within angle_tol degrees, either
+    sense). paths are parts or assemblies (all parts if omitted). Use the ids in builder targets
+    {"path": part, "faces": [ids]} or with Q.faces_by_id in run_apex_python. Read-only."""
+    return await _call("list_faces", paths=paths, kind=kind, near=near, radius=radius, normal=normal,
+                       angle_tol=angle_tol, limit=limit)
 
 
 @mcp.tool()
@@ -267,6 +333,26 @@ async def import_fe_model(model_file: str, unit_system: str, organize_by: Option
     CHANGES THE MODEL."""
     return await _call("import_fe_model", model_file=model_file, unit_system=unit_system,
                        organize_by=organize_by)
+
+
+@mcp.tool()
+async def export_bdf(path: Optional[str] = None, scenario: Optional[str] = None, summary: bool = True,
+                     hdf5: bool = True, unit_system: Optional[str] = None) -> str:
+    """Write the Nastran deck of a Nastran scenario (the only one, or `scenario`) to `path`
+    (default output/bdf/<scenario>.bdf). With summary=True the deck is read here, not in Apex,
+    and only this comes back: SOL, case control lines, card counts and lint warnings (contact
+    cards without BCONTACT or with a BCONTACT id that matches nothing; subcases without LOAD/SPC
+    or pointing at missing sets; RBE2 dependent nodes that are SPC'd or in two RBE2s; missing
+    property/material/GRID references; duplicate ids). hdf5 adds MDLPRM,HDF5. unit_system
+    defaults to config script_unit_system, else Apex's script units. Writes a file only."""
+    res = await _bridge("export_bdf", {k: v for k, v in dict(
+        path=path, scenario=scenario, hdf5=hdf5, unit_system=unit_system).items() if v is not None})
+    if summary:
+        try:
+            res.update(await anyio.to_thread.run_sync(lambda: bdf_summary.summarize(res["path"])))
+        except Exception as exc:
+            res["summary_error"] = "%s: %s" % (type(exc).__name__, exc)
+    return _json(res)
 
 
 # ---------------------------------------------------------------- viewport
@@ -331,13 +417,102 @@ async def cut_view(location: Optional[list[float]] = None, slice: bool = False, 
 async def screenshot(max_width: int = 1400) -> list:
     """Capture the Apex viewport as a PNG and return it as an image."""
     res = await _bridge("screenshot", {"max_width": max_width})
-    return [Image(path=res["path"]), json.dumps(res)]
+    return [Image(path=res["path"]), _json(res)]
+
+
+# ---------------------------------------------------------------- builders
+# Each one CHANGES THE MODEL (confirm with the user first), is idempotent (a repeat call with
+# the same name replaces what the earlier one made), and returns ids and counts only.
+# Targets: a pathName (whole part/solid/surface), {"path": part, "faces": [face ids]}
+# (ids from list_faces), {"path": part, "nodes": [node ids]}, or a list of these.
+@mcp.tool()
+async def create_material(name: str, E: float, nu: float, rho: Optional[float] = None,
+                          extra: Optional[dict] = None) -> str:
+    """Create or update an isotropic MAT1 material in script units (e.g. mm-t-s-N: E in MPa, rho in
+    t/mm^3). extra: further MAT1 fields by Apex name. CHANGES THE MODEL."""
+    return await _call("create_material", name=name, E=E, nu=nu, rho=rho, extra=extra)
+
+
+@mcp.tool()
+async def assign_solid_property(paths: list[str], material: str, name: Optional[str] = None) -> str:
+    """Create or update a PSOLID (default name PSOLID_<material>) pointing at `material` and assign
+    it to every solid of the given parts/assemblies (or the given solids). CHANGES THE MODEL."""
+    return await _call("assign_solid_property", paths=paths, material=material, name=name)
+
+
+@mcp.tool()
+async def mesh_solid(paths: list[str], size: float, order: str = "Quadratic", name: Optional[str] = None) -> str:
+    """Tet-mesh the solids of each part (createSolidMesh, order Quadratic | Linear), first deleting
+    the meshes already on those solids, so a re-mesh replaces rather than duplicates. Ties to mesh
+    nodes of a replaced mesh are lost; ties to faces survive. Returns element/node counts per
+    part. CHANGES THE MODEL."""
+    return await _call("mesh_solid", paths=paths, size=size, order=order, name=name)
+
+
+@mcp.tool()
+async def glue(name: str, side1: Any, side2: Any, tolerance: float = 0.5, type: str = "Glue") -> str:
+    """Manual interaction pair between two targets (typically faces: {"path": part, "faces": [ids]}),
+    with a manual contact tolerance (script length units). type: apex.attribute.InteractionType
+    member, default Glue. Needs BCONTACT in the subcases (static_scenario sets it). CHANGES THE MODEL."""
+    return await _call("glue", name=name, side1=side1, side2=side2, tolerance=tolerance, type=type)
+
+
+@mcp.tool()
+async def rbe2(ref: Any, attach: Any, dof: str = "123456", node_part: Optional[str] = None,
+               tol: float = 0.01) -> str:
+    """Rigid node tie (RBE2) from a reference node to `attach` (faces or nodes). ref is
+    {"path": part, "node": id} (e.g. a beam end node from beam) or [x,y,z]: an existing node of
+    node_part within tol, else a new node there (node_part is created if missing). A tie already
+    on that reference node is replaced. CHANGES THE MODEL."""
+    return await _call("rbe2", ref=ref, attach=attach, dof=dof, node_part=node_part, tol=tol)
+
+
+@mcp.tool()
+async def beam(name: str, points: list[list[float]], radius: float, material: str, mesh_size: float,
+               part: str, order: str = "Linear") -> str:
+    """Solid-round beam (e.g. bolt shank or pin) along a polyline through `points`, in `part`
+    (created if missing): curve, round BeamShape, free BeamSpan with `material`, curve mesh named
+    BeamMesh_<name>. Returns nodes_at_points: the mesh node id at each point, ready for rbe2 ref.
+    CHANGES THE MODEL."""
+    return await _call("beam", name=name, points=points, radius=radius, material=material,
+                       mesh_size=mesh_size, part=part, order=order)
+
+
+@mcp.tool()
+async def constrain(name: str, target: Any, type: str = "Clamped", dof: Optional[str] = None,
+                    id: Optional[int] = None) -> str:
+    """Displacement constraint (SPC) on a target. type: Clamped | Symmetry | Spherical | Axial |
+    General. dof (e.g. "123") fixes only those components through type General; that path is not
+    yet proven in Apex, so check the SPC cards with export_bdf. Re-creating keeps the old SPC set
+    id unless id is given. CHANGES THE MODEL."""
+    return await _call("constrain", name=name, target=target, type=type, dof=dof, id=id)
+
+
+@mcp.tool()
+async def nodal_load(name: str, target: Any, force: Optional[list[float]] = None,
+                     moment: Optional[list[float]] = None, id: Optional[int] = None) -> str:
+    """Force [fx,fy,fz] or moment [mx,my,mz] (one per call; each is one Nastran LOAD set) applied
+    directly to a target, usually {"path": part, "nodes": [id]}. Re-creating keeps the old LOAD
+    set id unless id is given. CHANGES THE MODEL."""
+    return await _call("nodal_load", name=name, target=target, force=force, moment=moment, id=id)
+
+
+@mcp.tool()
+async def static_scenario(name: str, subcases: list[dict], model_rep: Optional[str] = None,
+                          bcontact: Any = "auto") -> str:
+    """SOL 101 Nastran scenario with one subcase per entry of subcases=[{"name", "load",
+    "constraint", "bcontact"?}] (load / constraint by name). Sets LOAD, SPC and BCONTACT per
+    subcase and reads them back. bcontact "auto" sets BCONTACT=1 when the model has interactions;
+    an int sets that id; null leaves it off. model_rep: assembly path (default: the only top-level
+    assembly). Replaces a scenario of the same name. CHANGES THE MODEL."""
+    return await _call("static_scenario", name=name, subcases=subcases, model_rep=model_rep,
+                       bcontact="off" if bcontact is None else bcontact)
 
 
 # ------------------------------------------------------------------- skill
 # The apex-scripting skill (nastran-fea-skills, cloned into vendor/ by setup.bat) is served
 # from here so every MCP client gets it, not only clients that load skills themselves.
-_SKILL = {"obj": None, "consulted": False}
+_SKILL = {"obj": None, "consulted": False, "reminded": False}
 NO_SKILL = ("The apex-scripting skill is not installed, so Apex calls cannot be checked. Run setup.bat "
             "again (it clones %s into vendor/), or set skills_dir in config.json." % SKILLS_REPO)
 
@@ -379,11 +554,34 @@ async def apex_api_lookup(query: str, kind: str = "any", max_results: int = 5) -
 
 
 # --------------------------------------------------------------------- raw
+def format_script_result(res, show_log=False):
+    """Plain text for run_apex_python: stdout, then result=<compact JSON>, then the trimmed
+    traceback. JSON-wrapping the stdout would escape every newline and quote in it."""
+    if not isinstance(res, dict) or "stdout" not in res:  # e.g. the worker's size cap fired
+        return _json(res)
+    parts = []
+    if res.get("stdout"):
+        parts.append(res["stdout"].rstrip("\n"))
+    if "result" in res:
+        parts.append("result=" + _json(res["result"]))
+    if res.get("result_error"):
+        parts.append("result not returned: %s\npreview: %s" % (res["result_error"], res.get("result_preview", "")))
+    failed = bool(res.get("traceback"))
+    if failed:
+        parts.append(res["traceback"].rstrip("\n"))
+    if failed or show_log:
+        parts.append("[%s after %ss; script saved to %s]"
+                     % ("error" if failed else "ok", res.get("seconds"), res.get("logged_to")))
+    return "\n".join(parts) or "(ran, no output: print() or set result = ... to return something)"
+
+
 @mcp.tool()
-async def run_apex_python(code: str, attach: bool = True) -> str:
+async def run_apex_python(code: str, attach: bool = True, show_log_path: bool = False) -> str:
     """Run Python on Apex's script thread with the open Apex's `apex` module (keyword-only API).
-    Variables persist between calls. Set `result = ...` to return a value; print() output is
-    returned too (last 20k chars). Every script is saved to output/scripts.
+    Variables persist between calls. Returns plain text: print() output (last 20k chars), then
+    `result=<JSON>` if the script set `result = ...`, then on failure the script's traceback and
+    where the script was saved (every script is saved to output/scripts; show_log_path=True
+    reports the path on success too).
 
     MEMORY RULES - Apex shares this process with the user's model:
     * Never iterate part.elements / part.nodes / mesh.elements / mesh.nodes, and never read
@@ -391,10 +589,15 @@ async def run_apex_python(code: str, attach: bool = True) -> str:
     * Use bulk arrays: mesh.getElementIDs() {topology: ids}, mesh.getElementConnectivities(),
       mesh.getNodeIDs(), mesh.getNodeCoordinates() (flat xyz) - with numpy, which Apex ships.
     * Aggregate in the script; return counts / min / max / top-N, not raw lists.
-    * Helpers preloaded as Q: Q.part_summary(part), Q.mesh_summary(mesh, sample=3),
-      Q.sample_elements(mesh, n), Q.topology_counts(mesh), Q.solid_summary(solid),
-      Q.surface_summary(surf), Q.bbox(entity), Q.Budget(seconds) (`if b.over(): break`).
-    * Model changes: confirm with the user first.
+    * Helpers preloaded as Q (unless the script binds Q itself; `import queries as Q` brings it
+      back): Q.part_summary(part), Q.mesh_summary(mesh, sample=3), Q.sample_elements(mesh, n),
+      Q.topology_counts(mesh), Q.solid_summary(solid), Q.surface_summary(surf), Q.bbox(entity),
+      Q.Budget(seconds) (`if b.over(): break`), Q.faces_by_id(part, ids) -> EntityCollection,
+      Q.nodes_on_face(face_or_faces, ids_only=False), Q.nodes_where(mesh_or_part, fn) with
+      fn(xyz Nx3 numpy) -> bool mask, Q.nodes_by_id(part, ids), Q.node_near(part, xyz, tol),
+      Q.rle(ids) -> '1-3,7-7' for getNodes/getElements(ids=...), Q.face_shape(face).
+    * Model changes: confirm with the user first. The builder tools (create_material, mesh_solid,
+      glue, rbe2, beam, constrain, nodal_load, static_scenario, ...) cover the common steps.
 
     API RULES - generated Apex code usually fails on these:
     * Every argument by keyword; Apex accepts no positional arguments.
@@ -408,14 +611,13 @@ async def run_apex_python(code: str, attach: bool = True) -> str:
         raise ToolError("Not run. Read apex_scripting_guide('scripting-model') first, and check the "
                         "apex calls in this script with apex_api_lookup, then resend it. (Enforced once per "
                         "session; set require_skill_lookup to false in config.json to turn it off.)")
-    out = await _call("run_apex_python", code=code, attach=attach)
+    res = await _bridge("run_apex_python", {"code": code, "attach": attach})
+    out = format_script_result(res, show_log_path)
     if sk is None:
         return "NOTE: %s\n\n%s" % (NO_SKILL, out)
-    try:
-        failed = bool(json.loads(out).get("traceback"))
-    except (ValueError, AttributeError):
-        failed = False
-    if failed:  # script errors come back as a result with a traceback, not as a ToolError
+    # script errors come back as a result with a traceback, not as a ToolError
+    if isinstance(res, dict) and res.get("traceback") and not _SKILL["reminded"]:
+        _SKILL["reminded"] = True  # once per session
         out += ("\n\nThe script raised. Before retrying, look up the failing call with apex_api_lookup "
                 "(and apex_scripting_guide('pitfalls')) instead of guessing a new signature.")
     return out
