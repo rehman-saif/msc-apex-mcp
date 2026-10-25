@@ -1,4 +1,4 @@
-"""Localhost JSON-lines server used by the Claude Bridge palette tool.
+"""Localhost JSON-lines server used by the MCP Bridge palette tool.
 
 Pure Python (no apex, no .NET) so it can be tested outside Apex.
 
@@ -44,7 +44,7 @@ class BridgeServer:
         s.listen(1)
         s.settimeout(0.5)
         self._sock = s
-        self._thread = threading.Thread(target=self._loop, name="claude-bridge", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="mcp-bridge", daemon=True)
         self._thread.start()
         self.log("listening on %s:%d" % (self.host, self.port))
 

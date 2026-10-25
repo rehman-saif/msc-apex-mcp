@@ -1,4 +1,4 @@
-"""Claude Bridge - worker side. Runs on Apex's script thread via apex_sdk.runScriptFunction.
+"""MCP Bridge - worker side. Runs on Apex's script thread via apex_sdk.runScriptFunction.
 
 handle({"req_file", "resp_file", "root"}) reads one request, runs it through the
 shared handlers in Apex_MCP/apex_mcp/worker/apex_worker.py with the in-process
@@ -15,7 +15,7 @@ import sys
 
 _MODS = ("serialize", "queries", "builders", "apex_worker")
 # Kept in sys.modules so it survives Apex re-executing this file for each call.
-_ST = sys.modules.setdefault("_claude_bridge_worker_state", type(sys)("_claude_bridge_worker_state"))
+_ST = sys.modules.setdefault("_mcp_bridge_worker_state", type(sys)("_mcp_bridge_worker_state"))
 if not hasattr(_ST, "mtimes"):
     _ST.mtimes = {}
 _MTIMES = _ST.mtimes

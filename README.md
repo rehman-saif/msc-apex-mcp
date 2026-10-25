@@ -2,18 +2,18 @@
 
 Version **1.0.0** (kept in `apex_mcp\version.py`; `apex_status` reports it).
 
-Lets Claude work in **your own open MSC Apex 2024.1 session** for pre-processing:
+Lets any MCP client (Claude, Codex, Cursor, ...) work in **your own open MSC Apex 2024.1 session** for pre-processing:
 inspecting the model, checking CAD, driving the viewport and running Apex Python.
 Generic: nothing here knows about a particular model. Post-processing and .h5
 results tools were removed (October 2026).
 
 ```
-Claude ──stdio──> apex_mcp\server.py   (.venv: Python 3.14 + mcp)
+MCP client ──stdio──> apex_mcp\server.py   (.venv: Python 3.14 + mcp)
                      │  JSON over 127.0.0.1:47115 + token (config.json), one call at a time
                      ▼
-Apex ── palette "Claude" ── tool "Claude Bridge"   [Start] [Stop] [Self-test]
+Apex ── palette "MCP" ── tool "MCP Bridge"   [Start] [Stop] [Self-test]
           listener thread (UI side) ──apex_sdk.runScriptFunction──> Apex script thread
-                                            claude_bridge_worker.handle
+                                            mcp_bridge_worker.handle
                                             -> apex_mcp\worker\apex_worker.py (+ queries.py)
 ```
 
@@ -27,8 +27,8 @@ Needs Windows, MSC Apex 2024.1, Python 3.10+ and git (without git the skills are
    this folder's paths. If Claude Code is installed it offers to install the FEA skills plugin
    and register this server too (`setup.bat /y` does that without asking).
 2. **Register the palette in Apex:** Options → Application Settings → Custom Tools →
-   add `<this folder>\apex_palette`. Restart Apex if the **Claude** palette doesn't appear.
-3. Open your model, then **Claude → Claude Bridge → Self-test**.
+   add `<this folder>\apex_palette`. Restart Apex if the **MCP** palette doesn't appear.
+3. Open your model, then **MCP → MCP Bridge → Self-test**.
 4. Connect your MCP client:
 
 | Client | Where |
@@ -37,13 +37,13 @@ Needs Windows, MSC Apex 2024.1, Python 3.10+ and git (without git the skills are
 | Claude Desktop | merge `mcp_config.snippet.json` into `%APPDATA%\Claude\claude_desktop_config.json`, restart |
 | Cursor | merge `mcp_config.snippet.json` into `%USERPROFILE%\.cursor\mcp.json` |
 | Gemini CLI | merge `mcp_config.snippet.json` into `%USERPROFILE%\.gemini\settings.json` |
-| Codex CLI | append `codex_config.snippet.toml` to `%USERPROFILE%\.codex\config.toml` |
+| Codex CLI | `setup.bat` installs the FEA skills plugin and runs `codex mcp add`; or append `codex_config.snippet.toml` to `%USERPROFILE%\.codex\config.toml`. Keep `tool_timeout_sec = 300` (Codex defaults to 60 s, shorter than long Apex calls) |
 
 Re-run `setup.bat` to update the skills.
 
 ## Daily use
 
-Open Apex and your model, open **Claude Bridge** and press **Start**. Press **Stop** when done.
+Open Apex and your model, open **MCP Bridge** and press **Start**. Press **Stop** when done.
 Edits to `apex_worker.py`, `builders.py`, `queries.py` or `serialize.py` are picked up on the
 next call without restarting Apex. The bridge calls `apex.disableShowOutput()` on every call, so Apex's
 script-output dialog no longer opens and blocks the next call. Edits to `server.py` or
