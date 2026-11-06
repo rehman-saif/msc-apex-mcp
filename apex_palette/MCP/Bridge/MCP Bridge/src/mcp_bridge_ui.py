@@ -1,8 +1,8 @@
-"""Claude Bridge - Apex custom tool (UI side).
+"""MCP Bridge - Apex custom tool (UI side).
 
 Press Start: a listener on 127.0.0.1:<bridge_port> accepts the Apex MCP server
 (token from config.json). Each request is handed to Apex's script thread with
-apex_sdk.runScriptFunction -> claude_bridge_worker.handle, and the answer goes back.
+apex_sdk.runScriptFunction -> mcp_bridge_worker.handle, and the answer goes back.
 
 This file runs in the Apex UI process: it never imports `apex` and never does
 model work itself. Closing the panel does not stop the bridge; use Stop.
@@ -21,7 +21,7 @@ import System.Windows.Controls as WPF
 from System.Windows import Thickness, TextWrapping
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORKER = os.path.join(HERE, "claude_bridge_worker.py")
+WORKER = os.path.join(HERE, "mcp_bridge_worker.py")
 
 
 def _find_root(start):
@@ -45,7 +45,7 @@ def _cfg():
 
 
 # State survives closing/reopening the panel (module may be re-imported).
-_ST = sys.modules.setdefault("_claude_bridge_state", type(sys)("_claude_bridge_state"))
+_ST = sys.modules.setdefault("_mcp_bridge_state", type(sys)("_mcp_bridge_state"))
 if not hasattr(_ST, "server"):
     _ST.server = None
     _ST.lines = []
@@ -101,7 +101,7 @@ def _status_text():
     s = _ST.server
     if s is None or not s.running:
         return "Stopped"
-    who = "Claude connected" if s.client is not None else "waiting for Claude"
+    who = "MCP client connected" if s.client is not None else "waiting for MCP client"
     return "Listening on 127.0.0.1:%d  -  %s  -  calls: %d  %s" % (s.port, who, s.calls,
                                                                   ("(last: %s)" % s.last) if s.last else "")
 
@@ -167,6 +167,7 @@ def on_selftest(sender=None, args=None):
                 log("  list_tree FAILED: %s" % r.get("error"))
             r = dispatch({"id": "t3", "method": "screenshot", "params": {"max_width": 800}})
             log("  screenshot: %s" % (r["result"]["path"] if r.get("ok") else "FAILED " + str(r.get("error"))))
+            log("  version 1.0.0")
             log("self-test done")
         except Exception:
             log("self-test crashed:\n" + traceback.format_exc())
@@ -188,7 +189,7 @@ def getCustomToolPropertyContent():
     panel.Margin = Thickness(6)
 
     title = WPF.TextBlock()
-    title.Text = "Lets Claude (via the Apex MCP server) work in this Apex session."
+    title.Text = "Lets an MCP client (via the Apex MCP server) work in this Apex session."
     title.TextWrapping = TextWrapping.Wrap
     panel.Children.Add(title)
 
@@ -221,7 +222,7 @@ def getCustomToolPropertyContent():
 
 def getUIContent():
     tp = apex_sdk.ToolPropertyContainer()
-    tp.TitleText = "Claude Bridge"
+    tp.TitleText = "MCP Bridge"
     tp.IsCustomTool = True
     tp.IsObjectPropertyControl = False
     tp.IsAppliedVisible = False

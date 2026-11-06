@@ -30,10 +30,15 @@ if not exist output mkdir output
 set "CC="
 if /i "%~1"=="/y" (
   set "CC=--claude-code"
+  where codex >nul 2>&1 && set "CC=--claude-code --codex"
 ) else (
   where claude >nul 2>&1 && (
     choice /c YN /m "Configure Claude Code (install the FEA skills plugin and register this MCP server)"
     if not errorlevel 2 set "CC=--claude-code"
+  )
+  where codex >nul 2>&1 && (
+    choice /c YN /m "Register this MCP server with Codex CLI"
+    if not errorlevel 2 set "CC=%CC% --codex"
   )
 )
 ".venv\Scripts\python.exe" apex_mcp\setup_helper.py %CC% || exit /b 1
@@ -41,6 +46,6 @@ if /i "%~1"=="/y" (
 echo.
 echo Done. Next:
 echo   1. In Apex: Options - Application Settings - Custom Tools - add %CD%\apex_palette
-echo   2. Open a model, then Claude palette - Claude Bridge - Start
+echo   2. Open a model, then MCP palette - MCP Bridge - Start
 echo   3. Other MCP clients: copy mcp_config.snippet.json or codex_config.snippet.toml
 endlocal

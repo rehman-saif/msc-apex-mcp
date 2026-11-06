@@ -2,11 +2,11 @@
 <configurations xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <tool>
-    <name>Claude Bridge</name>
-    <icon>claude_bridge.png</icon>
-    <description>Start/stop the local bridge that lets Claude query and visualise this Apex session</description>
+    <name>MCP Bridge</name>
+    <icon>mcp_bridge.png</icon>
+    <description>Start/stop the local bridge that lets an MCP client query and visualise this Apex session</description>
     <tooltype>ui_tool</tooltype>
-    <runfile>claude_bridge_ui.py</runfile>
+    <runfile>mcp_bridge_ui.py</runfile>
     <Version>1.0</Version>
   </tool>
 </configurations>

@@ -2,9 +2,9 @@
 <configurations xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <palette>
-    <name>Claude</name>
-    <icon>claude_palette.png</icon>
-    <description>Connect this Apex session to Claude through the Apex MCP server</description>
+    <name>MCP</name>
+    <icon>mcp_palette.png</icon>
+    <description>Connect this Apex session to MCP clients through the Apex MCP server</description>
     <tool_groups Version="1.0" LastUpdate="20261017">
       <group Name="Bridge"/>
     </tool_groups>

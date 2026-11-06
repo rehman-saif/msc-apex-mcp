@@ -1,7 +1,7 @@
 """Apex MCP server (runs in the venv, Python 3.10+ with the `mcp` package).
 
-Claude Desktop starts this file over stdio. Every tool is forwarded to the
-"Claude Bridge" palette tool running inside the user's Apex (127.0.0.1:<bridge_port>,
+The MCP client (Claude, Codex, ...) starts this file over stdio. Every tool is forwarded to the
+"MCP Bridge" palette tool running inside the user's Apex (127.0.0.1:<bridge_port>,
 authenticated with bridge_token from config.json).
 
 Pre-processing only: model inspection, CAD checks, viewport and a raw-script escape
@@ -39,8 +39,8 @@ CONFIG_PATH = os.environ.get("APEX_MCP_CONFIG", os.path.join(ROOT, "config.json"
 sys.path.insert(0, os.path.join(ROOT, "apex_mcp", "worker"))
 from apex_worker import file_hashes  # noqa: E402  (pure Python; apex is imported lazily)
 
-NOT_RUNNING = ("Cannot reach the Claude Bridge in Apex on 127.0.0.1:%s. In Apex open the "
-               "'Claude' palette -> 'Claude Bridge' and press Start, then retry.")
+NOT_RUNNING = ("Cannot reach the MCP Bridge in Apex on 127.0.0.1:%s. In Apex open the "
+               "'MCP' palette -> 'MCP Bridge' and press Start, then retry.")
 
 
 def load_config():
@@ -53,7 +53,7 @@ def load_config():
 
 
 class Bridge:
-    """TCP client to the Claude Bridge tool inside Apex. Strictly one call at a time."""
+    """TCP client to the MCP Bridge tool inside Apex. Strictly one call at a time."""
 
     def __init__(self):
         self.conn = self.rfile = self.wfile = None
@@ -77,7 +77,7 @@ class Bridge:
         hello = json.loads(line) if line else {}
         if hello.get("hello") != "apex-bridge":
             self.close()
-            raise RuntimeError("Claude Bridge refused the connection: %s (bridge_token in config.json "
+            raise RuntimeError("MCP Bridge refused the connection: %s (bridge_token in config.json "
                                "must match the one Apex read when Start was pressed)" % hello.get("error"))
         self.hello = hello
 
@@ -127,7 +127,7 @@ class Bridge:
                 break
             self.close()  # bridge restarted or stopped: reconnect once
             if attempt == 2:
-                raise RuntimeError("Lost connection to the Claude Bridge during '%s'. %s"
+                raise RuntimeError("Lost connection to the MCP Bridge during '%s'. %s"
                                    % (method, NOT_RUNNING % load_config()["bridge_port"]))
         resp = json.loads(line)
         if not resp.get("ok"):
@@ -152,7 +152,7 @@ mcp = _Server("apex", instructions=(
     "run_apex_python; they change the model, so confirm with the user first. Check a deck with "
     "export_bdf, which returns only case control, card counts and lint warnings. "
     "If a tool says the bridge is unreachable, ask the user to press Start in Apex "
-    "(Claude palette -> Claude Bridge); if it says Apex is busy, wait instead of resending. "
+    "(MCP palette -> MCP Bridge); if it says Apex is busy, wait instead of resending. "
     "WRITING APEX PYTHON: recalled Apex calls are usually wrong (keyword-only arguments, update() "
     "instead of assignment, near-miss enum names). Before the first run_apex_python of a session read "
     "apex_scripting_guide('scripting-model'), and confirm every apex call, enum member and entity "
@@ -165,7 +165,7 @@ async def _bridge(method, params):
         return await anyio.to_thread.run_sync(lambda: BRIDGE.call(method, params))
     except ToolError:
         raise
-    except Exception as exc:  # start-up / timeout problems: show the real message to Claude
+    except Exception as exc:  # start-up / timeout problems: show the real message to the client
         raise ToolError("%s: %s" % (type(exc).__name__, exc)) from exc
 
 
@@ -192,7 +192,7 @@ def deployment_check(res):
     if not theirs:
         out["warning"] = ("the bridge's apex_worker.py does not report its folder, so it is an older copy "
                           "than this server's. Register %s in Apex (Application Settings -> Custom Tools) "
-                          "and press Stop/Start in Claude Bridge." % os.path.join(ROOT, "apex_palette"))
+                          "and press Stop/Start in MCP Bridge." % os.path.join(ROOT, "apex_palette"))
         return out
     out["bridge_root"], out["bridge_config"] = theirs.get("root"), theirs.get("config_path")
     mine, other = file_hashes(ROOT), theirs.get("hashes") or {}
@@ -207,7 +207,7 @@ def deployment_check(res):
         warn.append("%d file(s) differ between the two copies" % len(diff))
     if warn:
         out["warning"] = ("; ".join(warn) + ". Edits on one side do not reach the other. Point Apex's "
-                          "Custom Tools at %s and press Stop/Start in Claude Bridge, or copy the files."
+                          "Custom Tools at %s and press Stop/Start in MCP Bridge, or copy the files."
                           % os.path.join(ROOT, "apex_palette"))
     return out
 
@@ -221,7 +221,7 @@ async def _status(connect=True):
 
 @mcp.tool()
 async def apex_status(connect: bool = True) -> str:
-    """Connect to the Claude Bridge in Apex and report this server's version, Apex release, current model,
+    """Connect to the MCP Bridge in Apex and report this server's version, Apex release, current model,
     unit systems, project folder and the query limits in force. `deployment` compares the
     folder this server runs from with the one the Apex bridge loads its worker and config.json
     from (plus file hashes) and warns when they differ."""
@@ -230,7 +230,7 @@ async def apex_status(connect: bool = True) -> str:
 
 @mcp.tool()
 async def reconnect() -> str:
-    """Drop and re-open the connection to the Claude Bridge (use after pressing Stop/Start in Apex)."""
+    """Drop and re-open the connection to the MCP Bridge (use after pressing Stop/Start in Apex)."""
     await anyio.to_thread.run_sync(BRIDGE.close)
     return await _status()
 

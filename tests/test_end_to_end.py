@@ -1,4 +1,4 @@
-"""Offline end-to-end test (no Apex): MCP client -> server.py -> Claude Bridge UI code (fake
+"""Offline end-to-end test (no Apex): MCP client -> server.py -> MCP Bridge UI code (fake
 apex_sdk/.NET in uifakes) -> bridge worker -> apex_worker with a fake `apex` (fakes/).
 The fake raises if any tool walks part/mesh .elements or .nodes.
 Run from the venv:  python tests\\test_end_to_end.py
@@ -17,7 +17,7 @@ cfg.update(output_dir=os.path.join(PROJ, "output"), bridge_port=47199, call_time
            skills_dir=SKILLS, require_skill_lookup=True)
 json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
 sys.path[:0] = [os.path.join(HERE, "uifakes"), os.path.join(HERE, "fakes")]
-ui_path = os.path.join(PROJ, "apex_palette", "Claude", "Bridge", "Claude Bridge", "src", "claude_bridge_ui.py")
+ui_path = os.path.join(PROJ, "apex_palette", "MCP", "Bridge", "MCP Bridge", "src", "mcp_bridge_ui.py")
 spec = importlib.util.spec_from_file_location("ui", ui_path); ui = importlib.util.module_from_spec(spec); spec.loader.exec_module(ui)
 tp = ui.getUIContent(); print("panel:", tp.TitleText)
 ui.on_start(); time.sleep(0.3); print("status:", ui._status_text())

@@ -1,7 +1,7 @@
 """Apex tool handlers, run in-process on Apex's script thread.
 
-The "Claude Bridge" palette tool calls set_inprocess() once, then handle_request(req)
-for each request (via apex_sdk.runScriptFunction -> claude_bridge_worker.handle).
+The "MCP Bridge" palette tool calls set_inprocess() once, then handle_request(req)
+for each request (via apex_sdk.runScriptFunction -> mcp_bridge_worker.handle).
 
 Requests/responses:  {"id", "method", "params"}  ->  {"id", "ok", "result" | "error"}.
 
@@ -39,8 +39,8 @@ import serialize as S  # noqa: E402
 # Files whose copies must match between the MCP server and the bridge (apex_status compares them).
 DEPLOYED_FILES = ["apex_mcp/worker/apex_worker.py", "apex_mcp/worker/queries.py",
                   "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py",
-                  "apex_palette/Claude/Bridge/Claude Bridge/src/claude_bridge_worker.py",
-                  "apex_palette/Claude/Bridge/Claude Bridge/src/claude_bridge_ui.py"]
+                  "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_worker.py",
+                  "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_ui.py"]
 
 
 def file_hashes(root, rels=DEPLOYED_FILES):
@@ -716,7 +716,7 @@ def script_traceback(exc):
 
 def m_run_apex_python(p):
     if STATE["ns"] is None:
-        STATE["ns"] = {"__name__": "__claude__"}
+        STATE["ns"] = {"__name__": "__mcp__"}
     ns = STATE["ns"]
     _inject(ns, "Q", Q)
     _inject(ns, "S", S)

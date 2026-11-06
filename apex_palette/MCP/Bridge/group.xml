@@ -3,9 +3,9 @@
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <tool_group>
     <name>Bridge</name>
-    <description>Claude connection</description>
+    <description>MCP client connection</description>
     <tools>
-      <tool Name="Claude Bridge"/>
+      <tool Name="MCP Bridge"/>
     </tools>
     <Version>1.0</Version>
   </tool_group>

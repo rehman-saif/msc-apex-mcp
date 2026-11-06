@@ -7,7 +7,9 @@
                   apex_scripting_guide, so run_apex_python code is checked against the real API.
 3. snippets     - MCP client config with this folder's real paths (Claude Desktop, Cursor,
                   Gemini CLI: mcp_config.snippet.json; Codex CLI: codex_config.snippet.toml).
-4. --claude-code - installs the fea-structural-help plugin (all five skills) and registers
+4. --codex      - installs the fea-structural-help plugin in Codex CLI and registers this server
+                  (`codex plugin add`, `codex mcp add`).
+5. --claude-code - installs the fea-structural-help plugin (all five skills) and registers
                   this server, both at user scope.
 """
 import argparse
@@ -104,15 +106,40 @@ def register_claude_code():
           "WARNING: could not register the MCP server; see mcp_config.snippet.json")
 
 
+def register_codex():
+    codex = shutil.which("codex")
+    if not codex:
+        print("SKIP: 'codex' is not on PATH, so Codex was not configured")
+        return
+    r = subprocess.run([codex, "plugin", "marketplace", "add", MARKETPLACE])
+    if r.returncode == 0:  # also fine when already added; upgrade refreshes the snapshot
+        subprocess.run([codex, "plugin", "marketplace", "upgrade", MARKETPLACE.split("/")[1]],
+                       capture_output=True)
+        r = subprocess.run([codex, "plugin", "add", "%s@%s" % (PLUGIN, MARKETPLACE.split("/")[1])])
+    print("OK: %s plugin installed in Codex" % PLUGIN if r.returncode == 0 else
+          "WARNING: Codex plugin install failed; run: codex plugin marketplace add %s && "
+          "codex plugin add %s@%s" % (MARKETPLACE, PLUGIN, MARKETPLACE.split("/")[1]))
+    if subprocess.run([codex, "mcp", "get", "apex"], capture_output=True).returncode == 0:
+        print("OK: 'apex' MCP server already registered in Codex")
+        return
+    r = subprocess.run([codex, "mcp", "add", "apex", "--", PY, SERVER])
+    print("OK: 'apex' MCP server registered in Codex (add tool_timeout_sec = 300 under "
+          "[mcp_servers.apex] in ~/.codex/config.toml; see codex_config.snippet.toml)" if r.returncode == 0 else
+          "WARNING: could not register the MCP server; append codex_config.snippet.toml to ~/.codex/config.toml")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--claude-code", action="store_true", help="also configure Claude Code")
+    ap.add_argument("--codex", action="store_true", help="also register the server with Codex CLI")
     a = ap.parse_args()
     ensure_config()
     ensure_skills()
     write_snippets()
     if a.claude_code:
         register_claude_code()
+    if a.codex:
+        register_codex()
 
 
 if __name__ == "__main__":
