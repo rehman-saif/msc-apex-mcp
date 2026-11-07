@@ -85,7 +85,7 @@ def write_snippets():
     with open(os.path.join(ROOT, "mcp_config.snippet.json"), "w", encoding="utf-8") as fh:
         json.dump({"mcpServers": {"apex": entry}}, fh, indent=2)
     with open(os.path.join(ROOT, "codex_config.snippet.toml"), "w", encoding="utf-8") as fh:
-        fh.write("[mcp_servers.apex]\ncommand = '%s'\nargs = ['%s']\n" % (PY, SERVER))
+        fh.write("[mcp_servers.apex]\ncommand = '%s'\nargs = ['%s']\ntool_timeout_sec = 300\n" % (PY, SERVER))
     print("OK: client config written to mcp_config.snippet.json and codex_config.snippet.toml")
 
 

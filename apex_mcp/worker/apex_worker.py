@@ -82,7 +82,9 @@ def log(*a):
 def set_inprocess(config=None):
     """Use the `apex` module of the Apex process this code is running in."""
     if config:
+        CFG.clear()
         CFG.update(config)
+        STATE["attached"] = False  # ensure_apex applies script_unit_system again
     MODE["inprocess"] = True
     MODE["log_file"] = os.path.join(out_dir("bridge"), "bridge_worker.log")
 
@@ -118,7 +120,7 @@ def apex_bool(v):
 
 
 def limit_of(p):
-    return max(1, min(int(p.get("limit") or cfg("max_items")), 2000))
+    return max(1, min(int(p.get("limit") or cfg("max_items")), S.MAX_LIST))
 
 
 def ensure_apex():
@@ -240,11 +242,19 @@ def m_part_summary(p):
     """Per-mesh topology counts + sampled element attributes + per-body geometry stats."""
     ensure_apex()
     sample = max(0, min(int(p.get("sample_per_mesh", 3)), 50))
+    b = Q.Budget(cfg("query_time_budget_s"))
+    parts = parts_from(p.get("paths"))
     out = []
-    for part in parts_from(p.get("paths")):
+    for part in parts:
+        if b.over():
+            break
         out.append(Q.part_summary(part, sample=sample, geometry=bool(p.get("geometry", True)),
-                                  budget_s=cfg("query_time_budget_s"), max_items=limit_of(p)))
-    return {"parts": out}
+                                  budget_s=b.limit - b.elapsed(), max_items=limit_of(p)))
+    res = {"parts": out}
+    if len(out) < len(parts):
+        res["budget_exceeded"] = "summarised %d of %d parts; ask for fewer with paths" % (len(out), len(parts))
+        res["parts_skipped"] = len(parts) - len(out)
+    return res
 
 
 def m_geometry_check(p):
@@ -506,12 +516,20 @@ def m_export_bdf(p):
     path = p.get("path") or os.path.join(out_dir("bdf"), stem + ".bdf")
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    units = p.get("unit_system") or CFG.get("script_unit_system") or apex.getScriptUnitSystemLabel()
+    chosen = p.get("unit_system") or CFG.get("script_unit_system")
+    units = chosen or apex.getScriptUnitSystemLabel()
     kw = {"filename": path, "unitSystem": units}
     if scn is not None and p.get("hdf5", True):
         kw["resultOutputType"] = apex.attribute.NastranResultOutputType.Hdf5
     t0 = time.time()
-    (scn if scn is not None else apex.currentModel()).exportFEModel(**kw)
+    try:
+        (scn if scn is not None else apex.currentModel()).exportFEModel(**kw)
+    except RuntimeError as exc:
+        if "units system" not in str(exc):
+            raise
+        raise ValueError("Apex cannot export a deck in '%s'%s. Pass unit_system with a consistent system, "
+                         "e.g. mm-t-s-N-K or m-kg-s-N-K, in the units the model was built for."
+                         % (units, "" if chosen else ", its current script units")) from exc
     out = {"path": path, "scenario": Q.name_of(scn) if scn else None, "unit_system": units,
            "bytes": os.path.getsize(path), "seconds": round(time.time() - t0, 2)}
     if scn is None:
@@ -735,7 +753,7 @@ def m_run_apex_python(p):
     with contextlib.redirect_stdout(buf):
         try:
             exec(compile(code, SCRIPT, "exec"), ns)  # noqa: S102 - the user asked for a raw tool
-        except Exception as exc:
+        except BaseException as exc:  # sys.exit() too: its output and error must still come back
             err = script_traceback(exc)
     out = {"stdout": buf.getvalue()[-20000:], "seconds": round(time.time() - t0, 3), "logged_to": log_path}
     if "result" in ns:
@@ -778,7 +796,7 @@ def handle_request(req):
                    "preview": json.dumps(res, default=str)[:4000]}
         log("ok", method, "%.2fs" % (time.time() - t0))
         return {"id": rid, "ok": True, "result": res}
-    except Exception as exc:
+    except BaseException as exc:
         log("error", method, exc)
         return {"id": rid, "ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc()[-6000:]}

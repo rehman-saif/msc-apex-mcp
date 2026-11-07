@@ -21,7 +21,8 @@ MAX_TOTAL = 14000     # whole lookup response
 FUNC_HEAD = re.compile(r"^### `(apex(?:\.\w+)*)\.(\w+)\(")
 CLASS_HEAD = re.compile(r"^## `(apex(?:\.\w+)*)\.(\w+)`")
 INDEX_LINE = re.compile(r"^- `([\w.]+)`(?:\s+extends [^—]*)?(?:\s+—\s+(.*))?$")
-ENUM_LINE = re.compile(r"^- `([\w.]+)`: (.*)$")
+ENUM_LINE = re.compile(r"^\s*- `([\w.]+)`: (.*)$")  # indented: one line of a wrapped enum
+ENUM_WRAPPED = re.compile(r"^- `([\w.]+)` — \d+ members, wrapped below(?: — (.*))?$")
 
 
 def find_skill(cfg=None):
@@ -88,11 +89,17 @@ class ApexScriptingSkill:
 
     def enums(self):
         if self._enums is None:
-            self._enums = []
+            members, notes = {}, {}  # a long enum comes as a head line plus several lines of members
             for line in _read(os.path.join(self.api, "enums.md")).splitlines():
+                m = ENUM_WRAPPED.match(line)
+                if m:
+                    members.setdefault(m.group(1), [])
+                    notes[m.group(1)] = m.group(2) + " — " if m.group(2) else ""
+                    continue
                 m = ENUM_LINE.match(line)
                 if m:
-                    self._enums.append((m.group(1), m.group(2)))
+                    members.setdefault(m.group(1), []).append(m.group(2))
+            self._enums = [(n, notes.get(n, "") + ", ".join(p)) for n, p in members.items()]
         return self._enums
 
     def _block(self, folder, full_name, head_re, limit=MAX_BLOCK):
@@ -168,7 +175,12 @@ class ApexScriptingSkill:
             hits = sorted(hits, reverse=True)[:max_results]
             if hits:
                 parts.append("## Enums")
-                parts.extend("- `%s`: %s" % (n, _cut(m, MAX_ENUM_LINE)) for _, n, m in hits)
+                for _, n, m in hits:
+                    text = _cut(m, MAX_ENUM_LINE)
+                    hit = member.search(m)
+                    if hit and not member.search(text):
+                        text += " Includes %s." % hit.group(0)  # the member asked for was cut off
+                    parts.append("- `%s`: %s" % (n, text))
 
         if not parts:
             return ("Nothing in the Apex API reference matches %r. Do not guess the call: try "

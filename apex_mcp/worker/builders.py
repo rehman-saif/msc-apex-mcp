@@ -41,6 +41,17 @@ def _delete(apex, ents):
     return len(keep)
 
 
+def _vec3(what, values):
+    """Three floats, checked before a builder deletes what it is about to replace."""
+    try:
+        vec = [float(c) for c in values]
+    except (TypeError, ValueError):
+        vec = []
+    if len(vec) != 3:
+        raise ValueError("%s needs three numbers: got %r" % (what, values))
+    return vec
+
+
 def _model_getter(W, fn):
     return list(W._call_getter(fn, W.ensure_apex().currentModel()) or [])
 
@@ -278,6 +289,8 @@ def beam(W, p):
 def constrain(W, p):
     apex = W.ensure_apex()
     name = p["name"]
+    if p.get("dof") and not set(str(p["dof"])) <= set("123456"):
+        raise ValueError("dof must use the digits 1-6, e.g. \"123\": got %r" % (p["dof"],))
     tgt = targets(W, p["target"])
     kw = {"name": name, "target": tgt, "applicationMethod": apex.attribute.ApplicationMethod.Direct}
     if p.get("dof"):
@@ -301,6 +314,7 @@ def nodal_load(W, p):
     if (p.get("force") is None) == (p.get("moment") is None):
         raise ValueError("give force=[fx,fy,fz] or moment=[mx,my,mz]: one per load, since each load "
                          "is one Nastran LOAD set id")
+    x, y, z = _vec3("force" if p.get("force") is not None else "moment", p.get("force") or p.get("moment"))
     tgt = targets(W, p["target"])
     kw = {"name": name, "target": tgt, "applicationMethod": apex.attribute.ApplicationMethod.Direct}
     old = _named(apex.environment.getLoads() or [], name)
@@ -310,11 +324,9 @@ def nodal_load(W, p):
         kw["id"] = int(old.id)  # keep the LOAD set id that scenarios already point at
     replaced = _delete(apex, [old])
     if p.get("force") is not None:
-        fx, fy, fz = [float(c) for c in p["force"]]
-        load = apex.environment.createLoadForceComponent(forceX=fx, forceY=fy, forceZ=fz, **kw)
+        load = apex.environment.createLoadForceComponent(forceX=x, forceY=y, forceZ=z, **kw)
     else:
-        mx, my, mz = [float(c) for c in p["moment"]]
-        load = apex.environment.createLoadMomentComponent(momentX=mx, momentY=my, momentZ=mz, **kw)
+        load = apex.environment.createLoadMomentComponent(momentX=x, momentY=y, momentZ=z, **kw)
     return {"load": name, "id": Q.safe(lambda: load.id), "targets": tgt.len(), "replaced": bool(replaced)}
 
 

@@ -17,6 +17,11 @@ if not exist "%PYEXE%" (
   echo Could not find Python 3.10+ . Edit PYEXE in setup.bat.
   exit /b 1
 )
+"%PYEXE%" -c "import sys; sys.exit(sys.version_info < (3, 10))"
+if errorlevel 1 (
+  echo %PYEXE% is older than Python 3.10. Install a newer one or edit PYEXE in setup.bat.
+  exit /b 1
+)
 echo Using base Python: %PYEXE%
 
 if not exist ".venv\Scripts\python.exe" (
@@ -27,21 +32,23 @@ if not exist ".venv\Scripts\python.exe" (
 ".venv\Scripts\python.exe" -c "import mcp, sys; print('OK: mcp installed in', sys.prefix)"
 if not exist output mkdir output
 
-set "CC="
+rem Two variables: %VAR% inside a parenthesised block is read before the block runs.
+set "FOR_CLAUDE="
+set "FOR_CODEX="
 if /i "%~1"=="/y" (
-  set "CC=--claude-code"
-  where codex >nul 2>&1 && set "CC=--claude-code --codex"
+  set "FOR_CLAUDE=--claude-code"
+  where codex >nul 2>&1 && set "FOR_CODEX=--codex"
 ) else (
   where claude >nul 2>&1 && (
     choice /c YN /m "Configure Claude Code (install the FEA skills plugin and register this MCP server)"
-    if not errorlevel 2 set "CC=--claude-code"
+    if not errorlevel 2 set "FOR_CLAUDE=--claude-code"
   )
   where codex >nul 2>&1 && (
     choice /c YN /m "Register this MCP server with Codex CLI"
-    if not errorlevel 2 set "CC=%CC% --codex"
+    if not errorlevel 2 set "FOR_CODEX=--codex"
   )
 )
-".venv\Scripts\python.exe" apex_mcp\setup_helper.py %CC% || exit /b 1
+".venv\Scripts\python.exe" apex_mcp\setup_helper.py %FOR_CLAUDE% %FOR_CODEX% || exit /b 1
 
 echo.
 echo Done. Next:

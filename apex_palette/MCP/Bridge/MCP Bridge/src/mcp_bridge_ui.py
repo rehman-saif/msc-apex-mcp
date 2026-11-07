@@ -44,6 +44,11 @@ def _cfg():
         return json.load(fh)
 
 
+def _version():
+    with open(os.path.join(ROOT, "apex_mcp", "version.py"), "r", encoding="utf-8") as fh:
+        return fh.read().split('__version__ = "')[1].split('"')[0]
+
+
 # State survives closing/reopening the panel (module may be re-imported).
 _ST = sys.modules.setdefault("_mcp_bridge_state", type(sys)("_mcp_bridge_state"))
 if not hasattr(_ST, "server"):
@@ -147,7 +152,9 @@ def on_stop(sender=None, args=None):
 
 @apex_sdk.errorhandler
 def on_selftest(sender=None, args=None):
-    dispatch = _make_dispatch()
+    # share the running server's dispatch: it knows whether a timed-out call is still in Apex
+    running = _ST.server is not None and _ST.server.running
+    dispatch = _ST.server.dispatch if running else _make_dispatch()
 
     def run():
         try:
@@ -167,7 +174,7 @@ def on_selftest(sender=None, args=None):
                 log("  list_tree FAILED: %s" % r.get("error"))
             r = dispatch({"id": "t3", "method": "screenshot", "params": {"max_width": 800}})
             log("  screenshot: %s" % (r["result"]["path"] if r.get("ok") else "FAILED " + str(r.get("error"))))
-            log("  version 1.0.0")
+            log("  version %s" % _version())
             log("self-test done")
         except Exception:
             log("self-test crashed:\n" + traceback.format_exc())

@@ -7,6 +7,7 @@ as an error string instead of breaking the whole response.
 import math
 
 MAX_ITEMS = 25
+MAX_LIST = 2000  # longest list kept, and the highest `limit` a tool accepts; max_response_kb still applies
 
 
 def _is_entity(v):
@@ -67,9 +68,9 @@ def to_json(v, depth=1):
         return {str(k): to_json(x, depth - 1) for k, x in v.items()}
     if isinstance(v, (list, tuple, set)):
         items = list(v)
-        out = [to_json(x, depth - 1) for x in items[:200]]
-        if len(items) > 200:
-            out.append("... %d more" % (len(items) - 200))
+        out = [to_json(x, depth - 1) for x in items[:MAX_LIST]]
+        if len(items) > MAX_LIST:
+            out.append("... %d more" % (len(items) - MAX_LIST))
         return out
     # Bounding box
     if hasattr(v, "point1") and hasattr(v, "point2"):
@@ -103,7 +104,7 @@ def to_json(v, depth=1):
         pass
     try:
         if hasattr(v, "__len__") and hasattr(v, "__getitem__"):
-            return [to_json(v[i], depth - 1) for i in range(min(len(v), 200))]
+            return [to_json(v[i], depth - 1) for i in range(min(len(v), MAX_LIST))]
     except Exception:
         pass
     return str(v).split(".")[-1] if "." in str(v) and " " not in str(v) else str(v)

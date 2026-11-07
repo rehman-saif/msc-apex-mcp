@@ -72,13 +72,21 @@ class Bridge:
         self.conn = conn
         self.rfile = conn.makefile("r", encoding="utf-8", newline="\n")
         self.wfile = conn.makefile("w", encoding="utf-8", newline="\n")
-        self._send({"auth": cfg.get("bridge_token", "")})
-        line = self.rfile.readline()
-        hello = json.loads(line) if line else {}
+        try:
+            self._send({"auth": cfg.get("bridge_token", "")})
+            line = self.rfile.readline()
+            hello = json.loads(line) if line else {}
+        except (OSError, ValueError):
+            hello = {}
         if hello.get("hello") != "apex-bridge":
-            self.close()
-            raise RuntimeError("MCP Bridge refused the connection: %s (bridge_token in config.json "
-                               "must match the one Apex read when Start was pressed)" % hello.get("error"))
+            self.close()  # never send a request on this: it could run after the caller gave up
+            error = hello.get("error")
+            if error is None:
+                raise RuntimeError("The MCP Bridge on 127.0.0.1:%s did not answer. Press Stop then Start "
+                                   "in MCP Bridge, or restart Apex if it is not responding." % port)
+            if error == "bad token":
+                error += " (bridge_token in config.json must match the one Apex read when Start was pressed)"
+            raise RuntimeError("MCP Bridge refused the connection: %s" % error)
         self.hello = hello
 
     def close(self):
@@ -108,31 +116,40 @@ class Bridge:
             self.current = None
             self.lock.release()
 
+    def _closed_by_bridge(self):
+        """True if the bridge dropped this connection since the last call (Stop/Start in Apex)."""
+        try:
+            self.conn.setblocking(False)
+            return self.conn.recv(1, socket.MSG_PEEK) == b""
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+
     def _call(self, method, params, timeout):
-        for attempt in (1, 2):
-            if self.conn is None:
-                self.connect()
-            self.next_id += 1
-            rid = self.next_id
-            self.conn.settimeout(timeout or float(load_config().get("call_timeout_s", 300)) + 30)
-            try:
-                self._send({"id": rid, "method": method, "params": params or {}})
-                line = self.rfile.readline()
-            except socket.timeout:
-                self.close()
-                raise RuntimeError("Apex call '%s' timed out" % method)
-            except OSError:
-                line = ""
-            if line:
-                break
-            self.close()  # bridge restarted or stopped: reconnect once
-            if attempt == 2:
-                raise RuntimeError("Lost connection to the MCP Bridge during '%s'. %s"
-                                   % (method, NOT_RUNNING % load_config()["bridge_port"]))
+        if self.conn is not None and self._closed_by_bridge():
+            self.close()
+        if self.conn is None:
+            self.connect()
+        self.next_id += 1
+        rid = self.next_id
+        self.conn.settimeout(timeout or float(load_config().get("call_timeout_s", 300)) + 30)
+        try:
+            self._send({"id": rid, "method": method, "params": params or {}})
+            line = self.rfile.readline()
+        except socket.timeout:
+            self.close()
+            raise RuntimeError("Apex call '%s' timed out" % method)
+        except OSError:
+            line = ""
+        if not line:  # sent, so it may have run: resending could run a model change twice
+            self.close()
+            raise RuntimeError("Lost connection to the MCP Bridge during '%s'. It was not resent because it "
+                               "may have run: check the model before retrying." % method)
         resp = json.loads(line)
         if not resp.get("ok"):
-            raise ToolError("%s\n\nApex-side traceback (last lines):\n%s"
-                            % (resp.get("error"), (resp.get("traceback") or "")[-1500:]))
+            tb = (resp.get("traceback") or "")[-1500:]
+            raise ToolError(str(resp.get("error")) + ("\n\nApex-side traceback (last lines):\n" + tb if tb else ""))
         return resp.get("result")
 
 
@@ -346,7 +363,9 @@ async def export_bdf(path: Optional[str] = None, scenario: Optional[str] = None,
     cards without BCONTACT or with a BCONTACT id that matches nothing; subcases without LOAD/SPC
     or pointing at missing sets; RBE2 dependent nodes that are SPC'd or in two RBE2s; missing
     property/material/GRID references; duplicate ids). hdf5 adds MDLPRM,HDF5. unit_system
-    defaults to config script_unit_system, else Apex's script units. Writes a file only."""
+    defaults to config script_unit_system, else Apex's script units. Apex only exports consistent
+    systems such as mm-t-s-N-K or m-kg-s-N-K, and refuses mm-kg-s-N-K, so a model built in tonnes
+    needs unit_system='mm-t-s-N-K'. Writes a file only."""
     res = await _bridge("export_bdf", {k: v for k, v in dict(
         path=path, scenario=scenario, hdf5=hdf5, unit_system=unit_system).items() if v is not None})
     if summary:
