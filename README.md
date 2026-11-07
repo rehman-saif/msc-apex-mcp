@@ -8,7 +8,7 @@ Generic: nothing here knows about a particular model. Post-processing and .h5
 results tools were removed (October 2026).
 
 ```
-MCP client ──stdio──> apex_mcp\server.py   (.venv: Python 3.14 + mcp)
+MCP client ──stdio──> apex_mcp\server.py   (.venv: Python 3.10+ and mcp)
                      │  JSON over 127.0.0.1:47115 + token (config.json), one call at a time
                      ▼
 Apex ── palette "MCP" ── tool "MCP Bridge"   [Start] [Stop] [Self-test]
@@ -47,7 +47,11 @@ Open Apex and your model, open **MCP Bridge** and press **Start**. Press **Stop*
 Edits to `apex_worker.py`, `builders.py`, `queries.py` or `serialize.py` are picked up on the
 next call without restarting Apex. The bridge calls `apex.disableShowOutput()` on every call, so Apex's
 script-output dialog no longer opens and blocks the next call. Edits to `server.py` or
-`skills.py` need the MCP client restarted.
+`skills.py` need the MCP client restarted; edits to `bridge_core.py` or `mcp_bridge_ui.py` need
+Apex restarted.
+
+The bridge serves one MCP client at a time. A second one gets a clear refusal until the first
+closes, so close other sessions connected to this Apex first.
 
 Apex must load the bridge from **this** folder. If Apex's Custom Tools entry points at another
 copy of Apex_MCP, the server and the bridge drift apart and edits never reach Apex.
@@ -69,7 +73,9 @@ calls queued up behind it. Now:
 - Every response is size-checked (`max_response_kb`). An oversized response returns an error
   plus a preview, not megabytes of JSON.
 - The server sends one call at a time. A new call while one is still running fails at once
-  with "Apex is busy", instead of queueing.
+  with "Apex is busy", instead of queueing. A call that outlives `call_timeout_s` keeps running
+  in Apex, so new calls are refused until it ends, and a call that fails is never sent again by
+  itself.
 - `run_apex_python` has the same rules in its description, and the `Q` helper module is
   preloaded (`Q.part_summary`, `Q.mesh_summary`, `Q.sample_elements`, `Q.topology_counts`,
   `Q.solid_summary`, `Q.surface_summary`, `Q.bbox`, `Q.Budget`, `Q.faces_by_id`,
@@ -110,6 +116,9 @@ calls queued up behind it. Now:
   without a matching BCONTACT, subcases without LOAD/SPC or pointing at missing sets, RBE2
   dependent nodes that are SPC'd or in two RBE2s, missing property/material/GRID references,
   and duplicate ids. `python apex_mcp\bdf_summary.py deck.bdf` runs the same check on any deck.
+  Apex exports only in consistent unit systems such as `mm-t-s-N-K` or `m-kg-s-N-K`, and refuses
+  `mm-kg-s-N-K` even when those are its script units, so pass `unit_system` or set
+  `script_unit_system`.
 - `run_apex_python` returns plain text: stdout, then `result=<compact JSON>`, then on failure the
   script's own traceback frames and where the script was saved.
 
@@ -142,7 +151,7 @@ Apex GUI docs, Nastran reference, Nastran diagnostics and modelling strategy.
 | key | meaning |
 |---|---|
 | `bridge_port` / `bridge_token` | where the Apex tool listens, and the shared secret |
-| `script_unit_system` | e.g. `mm-kg-s-N`; empty leaves Apex's script units alone |
+| `script_unit_system` | e.g. `mm-t-s-N-K`; empty leaves Apex's script units alone |
 | `output_dir` | screenshots, scripts, exported decks (`bdf\`), logs |
 | `call_timeout_s` | maximum seconds the server waits for one Apex call |
 | `query_time_budget_s` | wall-clock budget for entity loops inside one query (default 20) |
@@ -153,12 +162,16 @@ Apex GUI docs, Nastran reference, Nastran diagnostics and modelling strategy.
 | `require_skill_lookup` | refuse the first `run_apex_python` until the API was consulted (default true) |
 
 `config.json` holds the bridge token and is not committed; `config.example.json` is the template.
+Edits apply on the next call, except `bridge_port`, `bridge_token` and `call_timeout_s`, which the
+bridge reads when Start is pressed.
 
 ## Developing
 
-From `.venv`, run `python tests\test_units.py` (BDF lint, deployment check, output format) and
+Install the test dependencies into `.venv` with `pip install -r requirements-dev.txt` (numpy and
+Pillow, which Apex ships but the venv does not). From `.venv`, run `python tests\test_units.py`
+(BDF lint, API lookup, worker handlers), `python tests\test_bridge.py` (connections, timeouts) and
 `python tests\test_end_to_end.py` (needs the skills in `vendor\`, or
-`APEX_SKILLS_DIR`; the `screenshot` step needs Pillow, which Apex ships but the venv does not). This runs the whole chain (MCP client →
+`APEX_SKILLS_DIR`). This runs the whole chain (MCP client →
 server → bridge UI code → worker) against a fake `apex`. Its `part.elements`/`mesh.elements`
 raise if touched, so the test fails if any tool walks elements.
 

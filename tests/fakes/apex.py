@@ -187,7 +187,7 @@ class Model(Part):
     def setCurrentPart(self, *, pathName):
         self.current = next(p for p in PARTS if p.pathName == pathName); return self.current
     def exportFEModel(self, *, filename, unitSystem):
-        _write_bdf(filename, None)
+        _check_units(unitSystem); _write_bdf(filename, None)
 
 
 _M = Model("RATO", "Model")
@@ -281,7 +281,12 @@ class ScnNastran(Named):
     def getSubcases(self): return Coll(self.subs)
     def associateModelRep(self, *, modelRep): self.rep = modelRep
     def exportFEModel(self, *, filename, unitSystem, resultOutputType=None):
-        _write_bdf(filename, self)
+        _check_units(unitSystem); _write_bdf(filename, self)
+
+
+def _check_units(label):
+    if label.startswith("mm-kg"):  # both mm-kg labels are refused by Apex 2024.1
+        raise RuntimeError("The specified units system is not supported")
 
 
 def _write_bdf(filename, scn):

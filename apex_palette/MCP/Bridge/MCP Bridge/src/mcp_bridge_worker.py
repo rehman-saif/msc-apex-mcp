@@ -48,9 +48,12 @@ def _load(root):
     _MTIMES.clear()
     _MTIMES.update(stamp)
     W = sys.modules["apex_worker"]
-    if changed or not W.MODE["inprocess"]:
-        with open(os.path.join(root, "config.json"), "r", encoding="utf-8") as fh:
+    config_path = os.path.join(root, "config.json")
+    config_mtime = os.path.getmtime(config_path)
+    if changed or not W.MODE["inprocess"] or config_mtime != getattr(_ST, "config_mtime", None):
+        with open(config_path, "r", encoding="utf-8") as fh:
             W.set_inprocess(json.load(fh))
+        _ST.config_mtime = config_mtime
         if changed:
             W.log("worker modules reloaded")
     return W
@@ -75,7 +78,7 @@ def handle(d):
         with open(req_file, "r", encoding="utf-8") as fh:
             req = json.load(fh)
         resp = W.handle_request(req)
-    except Exception as exc:  # import/config problems
+    except BaseException as exc:  # import/config problems; anything escaping opens a dialog in Apex
         import traceback
         resp = {"id": None, "ok": False, "error": "bridge worker: %s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc()[-4000:]}

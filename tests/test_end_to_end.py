@@ -17,6 +17,8 @@ cfg.update(output_dir=os.path.join(PROJ, "output"), bridge_port=47199, call_time
            skills_dir=SKILLS, require_skill_lookup=True)
 json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
 sys.path[:0] = [os.path.join(HERE, "uifakes"), os.path.join(HERE, "fakes")]
+sys.path.append(os.path.join(ROOT, "apex_mcp"))
+from version import __version__
 ui_path = os.path.join(PROJ, "apex_palette", "MCP", "Bridge", "MCP Bridge", "src", "mcp_bridge_ui.py")
 spec = importlib.util.spec_from_file_location("ui", ui_path); ui = importlib.util.module_from_spec(spec); spec.loader.exec_module(ui)
 tp = ui.getUIContent(); print("panel:", tp.TitleText)
@@ -50,7 +52,7 @@ async def main():
                 return txt
 
             t = await call("apex_status")
-            assert json.loads(t)["version"] == "1.0.0", t
+            assert json.loads(t)["version"] == __version__, t
             dep = json.loads(t)["deployment"]  # M9: same folder on both sides, so no warning
             assert dep["bridge_root"] and "warning" not in dep, dep
             t = await call("list_tree")
@@ -116,6 +118,14 @@ async def main():
             assert "script saved to" in t and "look up the failing call" in t, t
             t = await call("run_apex_python", code="1/0")
             assert "ZeroDivisionError" in t and "look up the failing call" not in t, t
+            # sys.exit reaches the client with its output, through the real worker entry point
+            t = await call("run_apex_python", code="import sys\nprint('kept')\nsys.exit(2)", show=200)
+            assert "kept" in t and "SystemExit: 2" in t, t
+            # config.json edits apply on the next call, without Stop/Start
+            cfg["max_items"] = 77
+            json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
+            t = await call("apex_status", show=120)
+            assert json.loads(t)["limits"]["max_items"] == 77, t
             # M8: builders, each run twice to prove they replace instead of duplicating
             for created in (True, False):
                 t = json.loads(await call("create_material", name="Ti", E=110000, nu=0.34, rho=4.43e-9))
@@ -155,7 +165,9 @@ async def main():
                 assert "warning" not in t, t
             await call("static_scenario", name="X", subcases=[{"load": "nope"}], expect_error=True)
             # M7: export with summary + lint (the fake deck has two deliberate faults)
-            t = json.loads(await call("export_bdf", show=600))
+            t = await call("export_bdf", expect_error=True)  # the fake's script units are refused, as in Apex
+            assert "mm-t-s-N-K" in t and "unit_system" in t, t
+            t = json.loads(await call("export_bdf", unit_system="mm-t-s-N-K", show=600))
             assert t["sol"] == "101" and "SUBCASE 1" in t["case_control"] and t["cards"]["GRID"] == 2, t
             lint = " | ".join(t["lint"])
             assert "no load card has set id" in lint and "also SPC'd" in lint, lint

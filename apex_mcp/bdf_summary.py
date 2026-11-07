@@ -6,7 +6,8 @@ case control lines, card counts and lint warnings for the mistakes that cost a s
     or a BCONTACT id that no BCONECT / BCTABLE / BCTABL1 defines;
   * a subcase without LOAD or SPC (after the global case control), or one whose set id
     matches no load / SPC card;
-  * RBE2 dependent nodes that are also SPC'd, or dependent in two RBE2s;
+  * RBE2 dependent DOFs that are also SPC'd, or dependent in two RBE2s (same node and component;
+    Nastran stops on these with UFM 2101, other components of the node are legal);
   * elements whose property is missing (or of the wrong family), properties whose material
     is missing, and GRID ids referenced but not defined; duplicate GRID / element ids.
 Small-field, large-field (*) and free-field (comma) cards are read; INCLUDE is followed.
@@ -25,6 +26,9 @@ LOAD_CARDS = {"FORCE", "FORCE1", "FORCE2", "MOMENT", "MOMENT1", "MOMENT2", "PLOA
               "ACCEL", "ACCEL1", "TEMP", "TEMPD", "DEFORM"}
 SPC_CARDS = {"SPC", "SPC1", "SPCADD"}
 MAT_CARDS = {"MAT1", "MAT2", "MAT3", "MAT4", "MAT5", "MAT8", "MAT9", "MAT10", "MAT11"}
+SCALAR_POINT_CARDS = {"SPOINT", "EPOINT"}
+MID_IN_FIELD_3 = {"PSOLID", "PLSOLID", "PLPLANE", "PBEAM", "PBEAML", "PBCOMP", "PBAR", "PBARL", "PROD",
+                  "PTUBE", "PSHEAR"}
 
 # element -> (number of grid fields after EID, PID, property family)
 ELEMENTS = {
@@ -69,6 +73,11 @@ def _ids(fields):
         out.append(v)
         i += 1
     return out
+
+
+def _components(field):
+    """The DOF digits of a component field, e.g. '123' -> {'1','2','3'}; 0 or blank (scalar) -> empty."""
+    return set(field or "") & set("123456")
 
 
 def _split_fixed(line, large):
@@ -178,14 +187,15 @@ def summarize(path):
     sol, case, glob, subs, has_cend = parse_case_control(head)
     counts = {}
     grids, grid_dups = set(), 0
+    scalar_points = set()
     elem_ids, elem_dups = set(), 0
     elem_pid = {}            # family -> {pid: [eid,...]}
     props = {}               # pid -> family
     prop_mids = []           # (card, pid, mid)
     mats = set()
     load_sids, spc_sids, bcontact_ids = set(), set(), set()
-    spc_nodes = set()
-    rbe2_dep = {}            # node -> [rbe2 eid]
+    spc_dofs = {}            # node -> set of SPC'd components
+    rbe2_dep = {}            # node -> [(rbe2 eid, set of dependent components)]
     refs = {}                # card -> set(grid ids referenced)
 
     for name, f in cards:
@@ -195,6 +205,8 @@ def summarize(path):
             if g in grids:
                 grid_dups += 1
             grids.add(g)
+        elif name in SCALAR_POINT_CARDS:
+            scalar_points.update(_ids(f))
         elif name in ELEMENTS:
             ngrid, fam = ELEMENTS[name]
             eid, pid = _int(f[0] if f else None), _int(f[1] if len(f) > 1 else None)
@@ -213,8 +225,10 @@ def summarize(path):
                 mid_fields = f[8::4]
             elif name == "PCOMPG":
                 mid_fields = f[9::8]
-            else:
+            elif name in MID_IN_FIELD_3:
                 mid_fields = f[1:2]
+            else:
+                mid_fields = []
             for m in mid_fields:
                 if _int(m):
                     prop_mids.append((name, pid, _int(m)))
@@ -228,22 +242,24 @@ def summarize(path):
                     refs.setdefault(name, set()).add(g)
         if name in SPC_CARDS:
             spc_sids.add(_int(f[0] if f else None))
-            if name == "SPC":
-                nodes = [_int(f[i]) for i in (1, 4) if i < len(f) and _int(f[i])]
-            elif name == "SPC1":
-                nodes = _ids(f[2:])
+            if name == "SPC":  # SID G1 C1 D1 G2 C2 D2
+                pairs = [(_int(f[i]), f[i + 1] if i + 1 < len(f) else "") for i in (1, 4) if i < len(f) and _int(f[i])]
+            elif name == "SPC1":  # SID C G1 G2 ...
+                pairs = [(g, f[1] if len(f) > 1 else "") for g in _ids(f[2:])]
             else:
-                nodes = []
-            spc_nodes.update(nodes)
-            refs.setdefault(name, set()).update(nodes)
+                pairs = []
+            for g, comp in pairs:
+                spc_dofs.setdefault(g, set()).update(_components(comp))
+            refs.setdefault(name, set()).update(g for g, _ in pairs)
         if name in BCONTACT_TARGETS:
             bcontact_ids.add(_int(f[0] if f else None))
         if name == "RBE2":
             eid = _int(f[0] if f else None)
             gn = _int(f[1] if len(f) > 1 else None)
             dep = _ids(f[3:])
+            cm = _components(f[2] if len(f) > 2 else "")
             for g in dep:
-                rbe2_dep.setdefault(g, []).append(eid)
+                rbe2_dep.setdefault(g, []).append((eid, cm))
             refs.setdefault(name, set()).update(dep + ([gn] if gn else []))
 
     lint = []
@@ -270,15 +286,21 @@ def summarize(path):
         b = d.get("BCONTACT")
         if b is not None and _int(b) is not None and _int(b) not in bcontact_ids:
             lint.append("%s: BCONTACT = %s but no BCONECT/BCTABLE/BCTABL1 has id %s" % (tag, b, b))
-    both = spc_nodes.intersection(rbe2_dep)
+    spcd = {g: [e for e, cm in deps if cm & spc_dofs[g]] for g, deps in rbe2_dep.items() if g in spc_dofs}
+    both = {g: es for g, es in spcd.items() if es}
     if both:
-        lint.append("%d RBE2 dependent node(s) are also SPC'd (RBE2 %s; nodes %s): Nastran fatal "
-                    "(dependent DOF cannot be constrained)"
-                    % (len(both), _examples({e for g in both for e in rbe2_dep[g]}), _examples(both)))
-    twice = [g for g, es in rbe2_dep.items() if len(es) > 1]
+        lint.append("%d RBE2 dependent node(s) are also SPC'd in the same component (RBE2 %s; nodes %s): "
+                    "Nastran fatal UFM 2101 if that SPC set is used"
+                    % (len(both), _examples({e for es in both.values() for e in es}), _examples(both)))
+    twice = {}
+    for g, deps in rbe2_dep.items():
+        shared = [e for i, (e, cm) in enumerate(deps) for j, (_, other) in enumerate(deps) if i != j and cm & other]
+        if shared:
+            twice[g] = shared
     if twice:
-        lint.append("%d node(s) are dependent in more than one RBE2 (nodes %s, RBE2 %s)"
-                    % (len(twice), _examples(twice), _examples({e for g in twice for e in rbe2_dep[g]})))
+        lint.append("%d node(s) are dependent in more than one RBE2 (nodes %s, RBE2 %s) in the same component: "
+                    "Nastran fatal UFM 2101"
+                    % (len(twice), _examples(twice), _examples({e for es in twice.values() for e in es})))
     for fam, by_pid in sorted(elem_pid.items()):
         for pid, eids in sorted(by_pid.items(), key=lambda kv: str(kv[0])):
             if pid not in props:
@@ -291,7 +313,7 @@ def summarize(path):
         if mid not in mats:
             lint.append("%s %s references material %s, which is not defined" % (card, pid, mid))
     for card, ids in sorted(refs.items()):
-        gone = ids - grids
+        gone = ids - grids - scalar_points
         if gone:
             lint.append("%s references %d undefined GRID id(s): %s" % (card, len(gone), _examples(gone)))
     if grid_dups:
