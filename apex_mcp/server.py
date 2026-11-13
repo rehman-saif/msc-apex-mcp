@@ -17,9 +17,10 @@ import socket
 import sys
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import anyio
+from pydantic import BaseModel, Field
 
 try:  # mcp 2.x
     from mcp.server.mcpserver import Image
@@ -162,8 +163,8 @@ mcp = _Server("apex", instructions=(
     "whole mesh (that crashed Apex on a 90k-element model). Use the bulk MeshBody arrays "
     "(getElementIDs, getNodeIDs, getNodeCoordinates, getElementConnectivities) and the Q helpers. "
     "Typical flow: apex_status -> list_tree -> part_summary / geometry_check on the parts of "
-    "interest -> list_connections / list_loads_constraints / list_catalog -> viewport tools + "
-    "screenshot to look. Entities are addressed by Apex pathName exactly as list_tree returns them. "
+    "interest -> list_connections / list_loads_constraints / list_catalog -> viewport / "
+    "screenshot to look (one screenshot call can isolate parts, set colours and take several views). Entities are addressed by Apex pathName exactly as list_tree returns them. "
     "To build a model prefer the builder tools (create_material, assign_solid_property, mesh_solid, "
     "glue, rbe2, beam, constrain, nodal_load, static_scenario; faces by id from list_faces) over "
     "run_apex_python; they change the model, so confirm with the user first. Check a deck with "
@@ -377,68 +378,113 @@ async def export_bdf(path: Optional[str] = None, scenario: Optional[str] = None,
 
 
 # ---------------------------------------------------------------- viewport
-@mcp.tool()
-async def visibility(action: str, paths: Optional[list[str]] = None, fit: bool = True,
-                     view: str = "iso1") -> str:
-    """Isolate or change what is shown. action: show_only | show | hide | show_all | hide_all.
-    paths are pathNames. With fit=True the camera is reset to `view` to frame what is visible."""
-    return await _call("visibility", action=action, paths=paths, fit=fit, view=view)
+# One scene description drives both tools: `viewport` applies it and leaves it, `screenshot`
+# applies it, takes the pictures and puts the user's scene back (worker/scene.py).
+class Style(BaseModel):
+    """How things are drawn. Fields left out are not touched."""
+    render_style: Optional[str] = Field(None, description="Wireframe | HiddenLines | Filled | FilledWithEdges | "
+                                        "Shaded | ShadedWithEdges. Applied to `paths`, or to every part if paths is omitted.")
+    paths: Optional[list[str]] = Field(None, description="Entities render_style applies to")
+    color: Optional[dict[str, list[int]]] = Field(None, description="pathName -> [r, g, b] (0-255)")
+    color_by_part: bool = Field(False, description="Give each visible part its own colour. Parts often share one "
+                                "colour, which makes isolated or multi-part pictures hard to read.")
+    transparency: Optional[dict[str, int]] = Field(None, description="pathName -> 0-100")
+    mesh_edges: Optional[bool] = None
+    loads_bc_markers: Optional[bool] = None
+    connection_markers: Optional[bool] = None
+
+
+class Highlight(BaseModel):
+    paths: Optional[list[str]] = Field(None, description="Whole entities by pathName")
+    part_path: Optional[str] = Field(None, description="With ids: elements or nodes inside this part")
+    ids: Optional[list[int]] = None
+    kind: str = Field("Element", description="Element | Node (with ids)")
+    color: Optional[list[int]] = Field(None, description="[r, g, b], default magenta")
+
+
+class Label(BaseModel):
+    text: str
+    at: list[float] = Field(description="[x, y, z] in the script unit system")
+    size: int = 14
+    color: Optional[list[int]] = None
+
+
+class Cut(BaseModel):
+    location: Optional[list[float]] = Field(None, description="[x, y, z], default model centre")
+    slice: bool = False
+    off: bool = Field(False, description="Hide the cut view again")
+
+
+class View(BaseModel):
+    """A camera: a preset (Apex fits it to what is visible) or a saved view, optionally zoomed."""
+    name: Optional[str] = Field(None, description="Label used in the result and on a contact sheet")
+    preset: Optional[str] = Field(None, description="iso1-iso4, x, -x, y, -y, z, -z, right(+X), left(-X), "
+                                  "back(+Y), front(-Y), top(+Z), bottom(-Z): the side the camera is on")
+    saved: Optional[str] = Field(None, description="A view stored with viewport(save_view=...)")
+    zoom: Optional[float] = Field(None, description=">1 closer, <1 farther; applied after the fit")
+    margin: Optional[float] = Field(None, description="Fit margin for this view, 0.3-1.0 (1.0 = Apex's tight fit)")
+
+
+class Scene(BaseModel):
+    """What is shown and how. Everything is optional; entities are Apex pathNames from list_tree."""
+    show_only: Optional[list[str]] = Field(None, description="Hide everything else, show these (parts, "
+                                           "assemblies, solids, surfaces ...)")
+    show: Optional[list[str]] = None
+    hide: Optional[list[str]] = None
+    show_all: bool = False
+    hide_all: bool = False
+    style: Optional[Style] = None
+    highlight: Optional[list[Highlight]] = None
+    clear_highlights: bool = False
+    labels: Optional[list[Label]] = None
+    clear_labels: bool = False
+    cut: Optional[Cut] = None
+
+
+def _scene(scene):
+    return scene.model_dump(exclude_none=True) if scene is not None else None
+
+
+def _view(v):
+    return v if v is None or isinstance(v, str) else v.model_dump(exclude_none=True)
 
 
 @mcp.tool()
-async def set_view(view: Optional[str] = None, focus: Optional[list[float]] = None,
-                   azimuth: Optional[float] = None, elevation: Optional[float] = None,
-                   roll: Optional[float] = None, zoom: Optional[float] = None,
-                   pan: Optional[list[float]] = None) -> str:
-    """Move the camera. view: iso1..iso4, x, y, z (prefix '-' to look from the other side; resets
-    and fits to everything displayed, including load/BC and coordinate-system markers - hide those
-    with display_options to frame just the parts). Then optional rotate by azimuth/elevation
-    degrees, roll, zoom factor (>1 closer) and pan=[horizontal, vertical]. focus=[x,y,z] is
-    unreliable in Apex 2024.1. Returns camera state."""
-    return await _call("set_view", view=view, focus=focus, azimuth=azimuth, elevation=elevation,
-                       roll=roll, zoom=zoom, pan=pan)
+async def viewport(scene: Optional[Scene] = None, view: Union[str, View, None] = None,
+                   save_view: Optional[str] = None, delete_view: Optional[str] = None,
+                   list_views: bool = False) -> str:
+    """Change what Apex's viewport shows and leave it that way (visibility, colours, render style,
+    markers, highlights, labels, cut view, camera). `scene` describes what is visible and how it is
+    drawn; `view` is a preset name ("iso1", "top", "-y", ...), a saved view, or a View object
+    (preset or saved + zoom). Presets are fitted by Apex to what is visible, so show_only first to
+    frame one part. For a view no preset gives, set it up in Apex and save_view it. save_view stores the camera under a name (reuse it later as
+    view/views entry, also in screenshot), delete_view removes one, list_views lists them. With
+    nothing given it just reports the camera. To take a picture without disturbing the user's
+    scene use `screenshot` instead."""
+    return await _call("viewport", scene=_scene(scene), view=_view(view), save_view=save_view,
+                       delete_view=delete_view, list_views=list_views or None)
 
 
 @mcp.tool()
-async def display_options(connection_markers: Optional[bool] = None, loads_bc_markers: Optional[bool] = None,
-                          mesh_edges: Optional[bool] = None, paths: Optional[list[str]] = None,
-                          render_style: Optional[str] = None, transparency: Optional[int] = None,
-                          clear_highlights: bool = False) -> str:
-    """Toggle connection markers, load/BC markers and mesh edges; set render_style
-    (Wireframe, HiddenLines, Filled, FilledWithEdges, Shaded, ShadedWithEdges) or transparency
-    (0-100) on parts/assemblies given by paths; optionally clear highlights."""
-    return await _call("display_options", connection_markers=connection_markers,
-                       loads_bc_markers=loads_bc_markers, mesh_edges=mesh_edges, paths=paths,
-                       render_style=render_style, transparency=transparency,
-                       clear_highlights=clear_highlights)
-
-
-@mcp.tool()
-async def highlight(part_path: Optional[str] = None, ids: Optional[list[int]] = None, kind: str = "Element",
-                    paths: Optional[list[str]] = None, color: Optional[list[int]] = None) -> str:
-    """Highlight elements/nodes by ID within a part (part_path + ids, kind Element|Node; capped by
-    max_highlight_ids) or whole entities by pathName, in an RGB color (default magenta)."""
-    return await _call("highlight", part_path=part_path, ids=ids, kind=kind, paths=paths, color=color)
-
-
-@mcp.tool()
-async def annotate(text: Optional[str] = None, location: Optional[list[float]] = None, size: int = 14,
-                   color: Optional[list[int]] = None, clear: bool = False) -> str:
-    """Draw a text label in the viewport at location [x,y,z], or clear=True to remove all labels."""
-    return await _call("annotate", text=text, location=location, size=size, color=color, clear=clear)
-
-
-@mcp.tool()
-async def cut_view(location: Optional[list[float]] = None, slice: bool = False, off: bool = False) -> str:
-    """Section the view with a cut plane through location (default: model centre). off=True removes it."""
-    return await _call("cut_view", location=location, slice=slice, off=off)
-
-
-@mcp.tool()
-async def screenshot(max_width: int = 1400) -> list:
-    """Capture the Apex viewport as a PNG and return it as an image."""
-    res = await _bridge("screenshot", {"max_width": max_width})
-    return [Image(path=res["path"]), _json(res)]
+async def screenshot(scene: Optional[Scene] = None, views: Optional[list[Union[str, View]]] = None,
+                     layout: str = "sheet", crop: str = "model", max_width: Optional[int] = None,
+                     margin: Optional[float] = None, restore: bool = True) -> list:
+    """Picture(s) of the Apex viewport. Optionally set up a scene first (show_only/hide parts,
+    colours, render style, highlights, labels, cut) and take up to 9 views in one call: presets
+    ("iso1", "top", "front", ...), saved views, or View objects. The user's scene and camera are
+    restored afterwards (restore=true); marker/edge toggles, highlights and cut views cannot be
+    read back and are listed under not_restored. layout "sheet" returns one labelled grid for
+    several views, "separate" one image each. crop "model" removes Apex's floating panels (model
+    browser, scale bar ...) by cropping to the model; "none" returns the whole viewport. Presets
+    are zoomed out to `margin` (default 0.85) so the model clears those panels; 1.0 = tight fit.
+    Notes: Apex captures SCREEN PIXELS, so its window is raised if something covers it (an
+    always-on-top window cannot be raised over and is reported). Parts often share one colour:
+    use style.color_by_part to tell them apart. Without arguments it captures what is on screen."""
+    res = await _bridge("screenshot", {k: v for k, v in dict(
+        scene=_scene(scene), views=[_view(v) for v in views] if views else None, layout=layout,
+        crop=crop, max_width=max_width, margin=margin, restore=restore).items() if v is not None})
+    paths = [res["sheet"]] if res.get("sheet") else [v["path"] for v in res["views"]]
+    return [Image(path=p) for p in paths] + [_json(res)]
 
 
 # ---------------------------------------------------------------- builders

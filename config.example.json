@@ -4,6 +4,7 @@
   "script_unit_system": "",
   "output_dir": "",
   "screenshot_max_width": 1400,
+  "screenshot_bring_to_front": true,
   "call_timeout_s": 300,
   "query_time_budget_s": 20,
   "max_items": 200,

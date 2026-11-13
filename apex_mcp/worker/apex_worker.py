@@ -34,11 +34,12 @@ if HERE not in sys.path:
 
 import builders as B  # noqa: E402
 import queries as Q  # noqa: E402
+import scene as SC  # noqa: E402
 import serialize as S  # noqa: E402
 
 # Files whose copies must match between the MCP server and the bridge (apex_status compares them).
 DEPLOYED_FILES = ["apex_mcp/worker/apex_worker.py", "apex_mcp/worker/queries.py",
-                  "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py",
+                  "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py", "apex_mcp/worker/scene.py",
                   "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_worker.py",
                   "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_ui.py"]
 
@@ -537,181 +538,6 @@ def m_export_bdf(p):
     return out
 
 
-# ------------------------------------------------------------- viewport
-def m_visibility(p):
-    apex = ensure_apex()
-    action = p["action"]
-    if action == "show_all":
-        apex.session.showAll()
-    elif action == "hide_all":
-        apex.session.hideAll()
-    else:
-        ents = entities_by_path(p.get("paths") or [])
-        if action == "show_only":
-            if ents.len() == 1:
-                ents[0].showOnly()
-            else:
-                apex.session.hideAll()
-                for e in ents:
-                    e.show()
-        elif action == "show":
-            for e in ents:
-                e.show()
-        elif action == "hide":
-            for e in ents:
-                e.hide()
-        else:
-            raise ValueError("action must be show_only, show, hide, show_all or hide_all")
-    if p.get("fit", True):
-        _view({"view": p.get("view", "iso1")})
-    apex.display.render()
-    return {"done": action}
-
-
-_VIEWS = {"iso1": "viewIsometric_1", "iso2": "viewIsometric_2", "iso3": "viewIsometric_3",
-          "iso4": "viewIsometric_4", "x": "viewFromX", "y": "viewFromY", "z": "viewFromZ"}
-
-
-def _view(p):
-    apex = ensure_apex()
-    cam = apex.display.getCamera()
-    v = p.get("view")
-    if v:
-        rev = v.startswith("-")
-        name = _VIEWS.get(v.lstrip("-+").lower())
-        if not name:
-            raise ValueError("view must be one of %s (prefix '-' to reverse)" % list(_VIEWS))
-        getattr(cam, name)(reverse=rev)
-    if p.get("focus") is not None:
-        x, y, z = [float(c) for c in p["focus"]]
-        cam.setFocalPoint(focalPoint=apex.Coordinate(x, y, z))  # needs an ILocation in 2024.1
-    if p.get("azimuth") or p.get("elevation"):
-        cam.rotate(azimuth_angle=float(p.get("azimuth", 0.0)), elevation_angle=float(p.get("elevation", 0.0)))
-    if p.get("roll"):
-        cam.roll(angle=float(p["roll"]))
-    if p.get("zoom"):
-        cam.zoom(factor=float(p["zoom"]))
-    if p.get("pan"):
-        h, vv = p["pan"]
-        cam.pan(horizontal_distance=float(h), vertical_distance=float(vv))
-    apex.display.render()
-    def xyz(fn):
-        v = Q.safe(fn)
-        return Q.safe(lambda: [round(float(v.x), 3), round(float(v.y), 3), round(float(v.z), 3)])
-    return {"camera": {"focal_point": xyz(cam.getFocalPoint), "position": xyz(cam.getPosition),
-                       "view_up": xyz(cam.getViewUp), "direction": xyz(cam.getDirectionOfProjection),
-                       "parallel_scale": Q.safe(lambda: round(float(cam.getParallelScale()), 3))}}
-
-
-def m_set_view(p):
-    return _view(p)
-
-
-def m_display_options(p):
-    apex = ensure_apex()
-    done = {}
-    for key, fn, arg in (("connection_markers", "displayConnectionMarkers", "display"),
-                         ("loads_bc_markers", "displayLoadsAndBCMarkers", "display"),
-                         ("mesh_edges", "displayMeshTopologyEdges", "displayEdges")):
-        if p.get(key) is not None:
-            done[key] = getattr(apex.session, fn)(**{arg: bool(p[key])})
-    if p.get("paths") and (p.get("render_style") or p.get("transparency") is not None):
-        kw = {}
-        if p.get("render_style"):
-            kw["renderStyle"] = enum(apex.session.DisplayRenderStyle, p["render_style"], "render_style")
-        if p.get("transparency") is not None:
-            kw["enableTransparency"] = apex_bool(int(p["transparency"]) > 0)
-            kw["transparencyLevel"] = int(p["transparency"])
-        for e in entities_by_path(p["paths"]):
-            e.update(**kw)
-        done["updated"] = p["paths"]
-    if p.get("clear_highlights"):
-        apex.session.clearHighlights()
-    apex.display.render()
-    return done
-
-
-def m_highlight(p):
-    apex = ensure_apex()
-    rgb = p.get("color", [255, 0, 255])
-    color = apex.ColorRGB(int(rgb[0]), int(rgb[1]), int(rgb[2]))
-    if p.get("ids"):
-        ids = [int(i) for i in p["ids"]]
-        cap = int(cfg("max_highlight_ids"))
-        if len(ids) > cap:
-            raise ValueError("%d ids requested; max_highlight_ids is %d" % (len(ids), cap))
-        coll = apex.get(target=[{"type": p.get("kind", "Element"), "path": p["part_path"],
-                                 "ids": Q.rle(ids)}])
-    else:
-        coll = entities_by_path(p["paths"])
-    n = 0
-    for e in coll:
-        e.highlight(colorRGB=color)
-        n += 1
-    apex.display.render()
-    return {"highlighted": n}
-
-
-def m_annotate(p):
-    apex = ensure_apex()
-    if p.get("clear"):
-        apex.display.clearAllGraphicsText()
-        return {"cleared": True}
-    x, y, z = [float(c) for c in p["location"]]
-    rgb = p.get("color", [0, 0, 0])
-    apex.display.displayText(text=p["text"], textLocation=apex.Coordinate(x, y, z),
-                             graphicsFontColor=apex.ColorRGB(int(rgb[0]), int(rgb[1]), int(rgb[2])),
-                             graphicsFontSize=int(p.get("size", 14)))
-    apex.display.render()
-    return {"annotated": p["text"]}
-
-
-def m_cut_view(p):
-    apex = ensure_apex()
-    if p.get("off"):
-        apex.display.displayCutViews(display=False)
-        apex.display.render()
-        return {"cut_view": "off"}
-    kw = {}
-    if p.get("location") is not None:
-        x, y, z = [float(c) for c in p["location"]]
-        kw["location"] = apex.Coordinate(x, y, z)
-    kw["bSlideMode"] = bool(p.get("slice", False))
-    apex.display.createCutView(**kw)
-    apex.display.displayCutViews(display=True)
-    apex.display.render()
-    return {"cut_view": "on"}
-
-
-def m_screenshot(p):
-    apex = ensure_apex()
-    apex.display.render()
-    folder = out_dir("screenshots")
-    prefix = "shot_%s" % stamp()
-    returned = apex.display.captureImage(path=folder, imageNamePrefix=prefix,
-                                         imageCaptureRegion=apex.display.CaptureRegionType.Viewport,
-                                         imageFormat=apex.display.ImageType.png)
-    path = returned if returned and os.path.isfile(returned) else None
-    if path is None:
-        cands = sorted(f for f in os.listdir(folder) if f.startswith(prefix))
-        if cands:
-            path = os.path.join(folder, cands[-1])
-    if path is None:
-        raise RuntimeError("captureImage returned %r and no file appeared in %s" % (returned, folder))
-    max_w = int(p.get("max_width", CFG.get("screenshot_max_width", 1400)))
-    size = None
-    try:
-        from PIL import Image
-        im = Image.open(path)
-        if im.width > max_w:
-            im = im.resize((max_w, int(im.height * max_w / im.width)))
-            im.save(path)
-        size = [im.width, im.height]
-    except Exception:
-        pass
-    return {"path": path, "size": size}
-
-
 # ----------------------------------------------------------------- raw
 SCRIPT = "<script>"  # filename scripts are compiled under; their traceback frames show this
 
@@ -776,6 +602,7 @@ def m_run_apex_python(p):
 
 METHODS = {name[2:]: fn for name, fn in globals().items() if name.startswith("m_") and callable(fn)}
 METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in B.TOOLS.items()})
+METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in SC.TOOLS.items()})
 
 
 def handle_request(req):
