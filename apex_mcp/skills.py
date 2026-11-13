@@ -23,6 +23,29 @@ CLASS_HEAD = re.compile(r"^## `(apex(?:\.\w+)*)\.(\w+)`")
 INDEX_LINE = re.compile(r"^- `([\w.]+)`(?:\s+extends [^—]*)?(?:\s+—\s+(.*))?$")
 ENUM_LINE = re.compile(r"^\s*- `([\w.]+)`: (.*)$")  # indented: one line of a wrapped enum
 ENUM_WRAPPED = re.compile(r"^- `([\w.]+)` — \d+ members, wrapped below(?: — (.*))?$")
+SIG_HEAD = re.compile(r"^### `(apex(?:\.\w+)*)\.(\w+)\((.*)\)(?: -> .*)?`\s*$")
+METHOD_LINE = re.compile(r"^- `(\w+)\(")
+METHOD_INDEX = re.compile(r"^- `((?:apex\.)?[\w.]+)\.(\w+)`(.*)$")
+INHERITED = re.compile(r"\(inherited by (.*)\)\s*$")
+MAX_SIG = 1200  # one signature line in an error report
+
+
+def split_params(text):
+    """Parameter names of 'a: [int], b: {str:[int]} = None' (commas inside brackets do not split)."""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return [n for n in (p.split(":")[0].split("=")[0].strip() for p in out) if n]
 
 
 def find_skill(cfg=None):
@@ -101,6 +124,89 @@ class ApexScriptingSkill:
                     members.setdefault(m.group(1), []).append(m.group(2))
             self._enums = [(n, notes.get(n, "") + ", ".join(p)) for n, p in members.items()]
         return self._enums
+
+    # ------------------------------------------------- structured index (preflight, error reports)
+    def doc_index(self):
+        """{'modules': set, 'functions': {qual: [[param names] per overload]}, 'classes': set,
+        'enums': {qual: [members]}} parsed from the generated reference."""
+        if getattr(self, "_doc", None) is None:
+            functions, modules = {}, set()
+            for f in sorted(glob.glob(os.path.join(self.api, "modules", "*.md"))):
+                modules.add(os.path.splitext(os.path.basename(f))[0])
+                for line in _read(f).splitlines():
+                    m = SIG_HEAD.match(line)
+                    if m:
+                        functions.setdefault(m.group(1) + "." + m.group(2), []).append(split_params(m.group(3)))
+            enums = {}
+            for line in _read(os.path.join(self.api, "enums.md")).splitlines():
+                m = ENUM_LINE.match(line)
+                if m:
+                    enums.setdefault(m.group(1), []).extend(re.findall(r"`(\w+)`", m.group(2).split(" — ")[0]))
+                    continue
+                m = INDEX_LINE.match(line)  # an enum that fits one line: - `apex.X`: `A`, `B`
+                if not m and line.startswith("- `") and "`: " in line:
+                    name, rest = line[3:].split("`: ", 1)
+                    enums.setdefault(name, []).extend(re.findall(r"`(\w+)`", rest.split(" — ")[0]))
+            self._doc = {"modules": modules, "functions": functions,
+                         "classes": {n for n, _ in self.classes()}, "enums": enums,
+                         "methods": set(self._method_index())}
+        return self._doc
+
+    def signature(self, qual):
+        """The documented signature line(s) of a module function, e.g. 'apex.getEntities(pathNames: [str])
+        -> apex.EntityCollection' (all overloads)."""
+        module = qual.rsplit(".", 1)[0]
+        path = os.path.join(self.api, "modules", module + ".md")
+        if not os.path.isfile(path):
+            return []
+        out = []
+        for line in _read(path).splitlines():
+            m = SIG_HEAD.match(line)
+            if m and m.group(1) + "." + m.group(2) == qual:
+                out.append(_cut(line[5:].rstrip().rstrip("`"), MAX_SIG))
+        return out
+
+    def _method_index(self):
+        if getattr(self, "_methods", None) is None:
+            idx = {}
+            for line in _read(os.path.join(self.api, "methods-index.md")).splitlines():
+                m = METHOD_INDEX.match(line)
+                if m:
+                    inh = INHERITED.search(m.group(3))
+                    heirs = set(re.findall(r"`(\w+)`", inh.group(1))) if inh else set()
+                    idx.setdefault(m.group(2), []).append((m.group(1), heirs))
+            self._methods = idx
+        return self._methods
+
+    def documented_methods(self, cls, bases=()):
+        """Method names the reference documents for a class, its own and inherited ones. bases (the
+        runtime MRO) matter: the index often says only 'inherited by 404 classes'."""
+        owners = {cls, *bases}
+        return {m for m, entries in self._method_index().items()
+                for decl, heirs in entries if decl.rsplit(".", 1)[-1] in owners or cls in heirs}
+
+    def class_brief(self, cls):
+        """(qualified name, one-line description) of a documented class by its short name, or None."""
+        for name, brief in self.classes():
+            if name.rsplit(".", 1)[-1] == cls:
+                return name, brief
+        return None
+
+    def method_signature(self, cls, method, bases=()):
+        """Documented signature line(s) of cls.method, found on cls or on the class it inherits it from
+        (bases: the runtime MRO, nearest first)."""
+        rank = {c: i for i, c in enumerate([cls] + [b for b in bases if b != cls])}
+        entries = [(decl, heirs) for decl, heirs in self._method_index().get(method, [])
+                   if decl.rsplit(".", 1)[-1] in rank or cls in heirs]
+        entries.sort(key=lambda e: rank.get(e[0].rsplit(".", 1)[-1], len(rank)))
+        for decl, heirs in entries:
+            block = self._block("classes", decl, CLASS_HEAD, limit=10 ** 6)
+            lines = [ln[2:] for ln in block.splitlines() if METHOD_LINE.match(ln) and METHOD_LINE.match(ln).group(1) == method]
+            if lines:
+                where = "" if decl.rsplit(".", 1)[-1] == cls else " (inherited from %s)" % decl
+                return ["%s.%s%s" % (cls, _cut(ln.strip("`").replace("` — ", " — ", 1), MAX_SIG), where)
+                        for ln in lines]
+        return []
 
     def _block(self, folder, full_name, head_re, limit=MAX_BLOCK):
         """The `###`/`##` section for full_name in api/<folder>/<module>.md, all overloads."""

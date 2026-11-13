@@ -1,0 +1,37 @@
+{
+  "_about": "Where Apex at runtime differs from the generated API reference (nastran-fea-skills). Measured live, see docs/apex-runtime-facts.md. Used by the run_apex_python preflight.",
+  "release": "MSC Apex 2024.1 (build CLR:011290)",
+  "moved": {
+    "apex.DataTable2Col": "apex.catalog.DataTable2Col",
+    "apex.DataTable3Col": "apex.catalog.DataTable3Col",
+    "apex.attribute.PointSensor": "apex.instrument.PointSensor",
+    "apex.ConstraintAxis": "apex.session.ConstraintAxis"
+  },
+  "absent": [
+    "apex.LocationInternal",
+    "apex.studies.ModalFrequencyStep",
+    "apex.attribute.ExtendedKeyword",
+    "apex.attribute.KeywordMaterialPrimary",
+    "apex.attribute.KeywordMaterialSecondary",
+    "apex.attribute.MaterialModelType",
+    "apex.attribute.MaterialTypeDomain",
+    "apex.geometry.GeometryFaultType",
+    "apex.geometry.GeometryFeatureType"
+  ],
+  "absent_methods": {
+    "asEvent": "Entity.asEvent",
+    "asLoadCase": "Entity.asLoadCase",
+    "getLocationInternal": "gendes.NonDesignRegion.getLocationInternal",
+    "createStaticStep": "studies.Scenario.createStaticStep",
+    "createDynamicStep": "studies.Scenario.createDynamicStep",
+    "getStaticStep": "studies.Scenario.getStaticStep",
+    "getDynamicStep": "studies.Scenario.getDynamicStep",
+    "getAcfCommands": "studies.Scenario.getAcfCommands",
+    "createScenarioMBDScripted": "studies.Study.createScenarioMBDScripted",
+    "createScenarioMBDStandard": "studies.Study.createScenarioMBDStandard"
+  },
+  "notes": {
+    "apex.session.hideAll": "sets a visibility flag on every entity, so the earlier visibility cannot be restored; use part.hide()/show(), or the viewport tool.",
+    "apex.display.captureImage": "grabs the screen pixels of Apex's window: windows covering Apex end up in the image, and with the UI hidden it writes a 0-byte file without raising. Use the screenshot tool."
+  }
+}

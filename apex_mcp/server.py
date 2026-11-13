@@ -21,6 +21,7 @@ from typing import Any, Optional, Union
 
 import anyio
 from pydantic import BaseModel, Field
+from mcp.types import ToolAnnotations
 
 try:  # mcp 2.x
     from mcp.server.mcpserver import Image
@@ -32,6 +33,8 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp.exceptions import ToolError
 
 import bdf_summary
+import preflight as PF
+from describe_text import format_describe
 from skills import SKILLS_REPO, ApexScriptingSkill, find_skill
 from version import __version__
 
@@ -154,11 +157,17 @@ class Bridge:
         return resp.get("result")
 
 
+# Tool annotations: MCP clients can auto-allow READS and ask before CHANGES. LOOKS change only the
+# view or write an output file (screenshot restores the scene it set up).
+READS = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+LOOKS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+CHANGES = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+
 BRIDGE = Bridge()
 mcp = _Server("apex", instructions=(
     "Tools that drive the user's open MSC Apex session for pre-processing. "
     "Apex runs ONE call at a time on its script thread and shares memory with the user's model, "
-    "so: never send Apex tools in parallel; prefer the summary tools; and in run_apex_python never "
+    "so: never send Apex tools in parallel; prefer the summary tools; and in a script never "
     "iterate part.elements / part.nodes / mesh.elements or read per-element properties across a "
     "whole mesh (that crashed Apex on a 90k-element model). Use the bulk MeshBody arrays "
     "(getElementIDs, getNodeIDs, getNodeCoordinates, getElementConnectivities) and the Q helpers. "
@@ -167,15 +176,19 @@ mcp = _Server("apex", instructions=(
     "screenshot to look (one screenshot call can isolate parts, set colours and take several views). Entities are addressed by Apex pathName exactly as list_tree returns them. "
     "To build a model prefer the builder tools (create_material, assign_solid_property, mesh_solid, "
     "glue, rbe2, beam, constrain, nodal_load, static_scenario; faces by id from list_faces) over "
-    "run_apex_python; they change the model, so confirm with the user first. Check a deck with "
+    "run_apex_python; they change the model, so confirm with the user first. For a read the summary "
+    "tools do not cover, use query_apex_python: it refuses scripts that would change anything, so "
+    "it needs no confirmation; keep run_apex_python for changes. Check a deck with "
     "export_bdf, which returns only case control, card counts and lint warnings. "
     "If a tool says the bridge is unreachable, ask the user to press Start in Apex "
     "(MCP palette -> MCP Bridge); if it says Apex is busy, wait instead of resending. "
-    "WRITING APEX PYTHON: recalled Apex calls are usually wrong (keyword-only arguments, update() "
-    "instead of assignment, near-miss enum names). Before the first run_apex_python of a session read "
+    "WRITING APEX PYTHON: recalled Apex calls are usually wrong (argument names, update() "
+    "instead of assignment, near-miss enum names). Both script tools check a script before running it "
+    "and report what it changed in the model (effects=...). Before the first script of a session read "
     "apex_scripting_guide('scripting-model'), and confirm every apex call, enum member and entity "
-    "property you are not certain of with apex_api_lookup. If a script fails, look the failing call "
-    "up before retrying instead of guessing a new signature."))
+    "property you are not certain of with apex_api_lookup (the documentation) or apex_describe (what this "
+    "Apex really has: modules, signatures, enum members, an entity's properties and values). If a script "
+    "fails, look the failing call up before retrying instead of guessing a new signature."))
 
 
 async def _bridge(method, params):
@@ -237,7 +250,7 @@ async def _status(connect=True):
     return _json(res)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def apex_status(connect: bool = True) -> str:
     """Connect to the MCP Bridge in Apex and report this server's version, Apex release, current model,
     unit systems, project folder and the query limits in force. `deployment` compares the
@@ -246,7 +259,7 @@ async def apex_status(connect: bool = True) -> str:
     return await _status(connect)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOOKS)
 async def reconnect() -> str:
     """Drop and re-open the connection to the MCP Bridge (use after pressing Stop/Start in Apex)."""
     await anyio.to_thread.run_sync(BRIDGE.close)
@@ -254,14 +267,14 @@ async def reconnect() -> str:
 
 
 # ------------------------------------------------------------------- model
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_tree(counts: bool = True, max_depth: int = 10, limit: Optional[int] = None) -> str:
     """Assembly/part tree with pathNames and visibility; with counts, numbers of solids, surfaces,
     meshes, elements and nodes per part (element/node totals come from bulk ID arrays)."""
     return await _call("list_tree", counts=counts, max_depth=max_depth, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def part_summary(paths: Optional[list[str]] = None, sample_per_mesh: int = 3,
                        geometry: bool = True, limit: Optional[int] = None) -> str:
     """The safe way to understand a part (or every part under an assembly path; all parts if
@@ -273,7 +286,7 @@ async def part_summary(paths: Optional[list[str]] = None, sample_per_mesh: int =
                        geometry=geometry, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def geometry_check(paths: Optional[list[str]] = None, small_feature_tolerance: float = 0.5,
                          faults: bool = True, small_features: bool = True,
                          limit: Optional[int] = None) -> str:
@@ -286,7 +299,7 @@ async def geometry_check(paths: Optional[list[str]] = None, small_feature_tolera
                        faults=faults, small_features=small_features, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def get_entity(path: str, properties: Optional[list[str]] = None) -> str:
     """Reference and bounding box of one entity by pathName, plus any listed Apex properties
     (e.g. ['material','thickness']; collections come back as counts). For mesh, property and
@@ -294,7 +307,7 @@ async def get_entity(path: str, properties: Optional[list[str]] = None) -> str:
     return await _call("get_entity", path=path, properties=properties)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_faces(paths: Optional[list[str]] = None, kind: Optional[str] = None,
                      near: Optional[list[float]] = None, radius: Optional[float] = None,
                      normal: Optional[list[float]] = None, angle_tol: float = 5.0,
@@ -309,7 +322,7 @@ async def list_faces(paths: Optional[list[str]] = None, kind: Optional[str] = No
                        angle_tol=angle_tol, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def find_entities(name_contains: str, include_connections: bool = True,
                         limit: Optional[int] = None) -> str:
     """Find assemblies, parts and (optionally) connections whose name contains the text."""
@@ -317,7 +330,7 @@ async def find_entities(name_contains: str, include_connections: bool = True,
                        include_connections=include_connections, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_connections(details: bool = False, properties: Optional[list[str]] = None,
                            per_type: int = 10, limit: Optional[int] = None) -> str:
     """Connections in the model (fasteners, 3D bolts, rigid links, bushings, connectors, node/
@@ -328,25 +341,25 @@ async def list_connections(details: bool = False, properties: Optional[list[str]
                        per_type=per_type, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_loads_constraints(limit: Optional[int] = None) -> str:
     """Counts and names of all loads and constraints in the environment."""
     return await _call("list_loads_constraints", limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_catalog(limit: Optional[int] = None) -> str:
     """Names of materials (all and assigned), 2D and 3D element properties and layered panels."""
     return await _call("list_catalog", limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def list_scenarios() -> str:
     """Studies and scenarios (incl. Nastran scenarios) with solution type, status and subcases."""
     return await _call("list_scenarios")
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def import_fe_model(model_file: str, unit_system: str, organize_by: Optional[str] = None) -> str:
     """Import a Nastran BDF into the current Apex model. unit_system e.g. 'mm-kg-s-N'.
     organize_by: ByMaterial, ByProperty, ByContiguousMesh, ByElementType, SinglePart.
@@ -355,7 +368,7 @@ async def import_fe_model(model_file: str, unit_system: str, organize_by: Option
                        organize_by=organize_by)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOOKS)
 async def export_bdf(path: Optional[str] = None, scenario: Optional[str] = None, summary: bool = True,
                      hdf5: bool = True, unit_system: Optional[str] = None) -> str:
     """Write the Nastran deck of a Nastran scenario (the only one, or `scenario`) to `path`
@@ -449,7 +462,7 @@ def _view(v):
     return v if v is None or isinstance(v, str) else v.model_dump(exclude_none=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOOKS)
 async def viewport(scene: Optional[Scene] = None, view: Union[str, View, None] = None,
                    save_view: Optional[str] = None, delete_view: Optional[str] = None,
                    list_views: bool = False) -> str:
@@ -465,7 +478,7 @@ async def viewport(scene: Optional[Scene] = None, view: Union[str, View, None] =
                        delete_view=delete_view, list_views=list_views or None)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOOKS)
 async def screenshot(scene: Optional[Scene] = None, views: Optional[list[Union[str, View]]] = None,
                      layout: str = "sheet", crop: str = "model", max_width: Optional[int] = None,
                      margin: Optional[float] = None, restore: bool = True) -> list:
@@ -492,7 +505,7 @@ async def screenshot(scene: Optional[Scene] = None, views: Optional[list[Union[s
 # the same name replaces what the earlier one made), and returns ids and counts only.
 # Targets: a pathName (whole part/solid/surface), {"path": part, "faces": [face ids]}
 # (ids from list_faces), {"path": part, "nodes": [node ids]}, or a list of these.
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def create_material(name: str, E: float, nu: float, rho: Optional[float] = None,
                           extra: Optional[dict] = None) -> str:
     """Create or update an isotropic MAT1 material in script units (e.g. mm-t-s-N: E in MPa, rho in
@@ -500,14 +513,14 @@ async def create_material(name: str, E: float, nu: float, rho: Optional[float] =
     return await _call("create_material", name=name, E=E, nu=nu, rho=rho, extra=extra)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def assign_solid_property(paths: list[str], material: str, name: Optional[str] = None) -> str:
     """Create or update a PSOLID (default name PSOLID_<material>) pointing at `material` and assign
     it to every solid of the given parts/assemblies (or the given solids). CHANGES THE MODEL."""
     return await _call("assign_solid_property", paths=paths, material=material, name=name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def mesh_solid(paths: list[str], size: float, order: str = "Quadratic", name: Optional[str] = None) -> str:
     """Tet-mesh the solids of each part (createSolidMesh, order Quadratic | Linear), first deleting
     the meshes already on those solids, so a re-mesh replaces rather than duplicates. Ties to mesh
@@ -516,7 +529,7 @@ async def mesh_solid(paths: list[str], size: float, order: str = "Quadratic", na
     return await _call("mesh_solid", paths=paths, size=size, order=order, name=name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def glue(name: str, side1: Any, side2: Any, tolerance: float = 0.5, type: str = "Glue") -> str:
     """Manual interaction pair between two targets (typically faces: {"path": part, "faces": [ids]}),
     with a manual contact tolerance (script length units). type: apex.attribute.InteractionType
@@ -524,7 +537,7 @@ async def glue(name: str, side1: Any, side2: Any, tolerance: float = 0.5, type: 
     return await _call("glue", name=name, side1=side1, side2=side2, tolerance=tolerance, type=type)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def rbe2(ref: Any, attach: Any, dof: str = "123456", node_part: Optional[str] = None,
                tol: float = 0.01) -> str:
     """Rigid node tie (RBE2) from a reference node to `attach` (faces or nodes). ref is
@@ -534,7 +547,7 @@ async def rbe2(ref: Any, attach: Any, dof: str = "123456", node_part: Optional[s
     return await _call("rbe2", ref=ref, attach=attach, dof=dof, node_part=node_part, tol=tol)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def beam(name: str, points: list[list[float]], radius: float, material: str, mesh_size: float,
                part: str, order: str = "Linear") -> str:
     """Solid-round beam (e.g. bolt shank or pin) along a polyline through `points`, in `part`
@@ -545,7 +558,7 @@ async def beam(name: str, points: list[list[float]], radius: float, material: st
                        mesh_size=mesh_size, part=part, order=order)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def constrain(name: str, target: Any, type: str = "Clamped", dof: Optional[str] = None,
                     id: Optional[int] = None) -> str:
     """Displacement constraint (SPC) on a target. type: Clamped | Symmetry | Spherical | Axial |
@@ -555,7 +568,7 @@ async def constrain(name: str, target: Any, type: str = "Clamped", dof: Optional
     return await _call("constrain", name=name, target=target, type=type, dof=dof, id=id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def nodal_load(name: str, target: Any, force: Optional[list[float]] = None,
                      moment: Optional[list[float]] = None, id: Optional[int] = None) -> str:
     """Force [fx,fy,fz] or moment [mx,my,mz] (one per call; each is one Nastran LOAD set) applied
@@ -564,7 +577,7 @@ async def nodal_load(name: str, target: Any, force: Optional[list[float]] = None
     return await _call("nodal_load", name=name, target=target, force=force, moment=moment, id=id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CHANGES)
 async def static_scenario(name: str, subcases: list[dict], model_rep: Optional[str] = None,
                           bcontact: Any = "auto") -> str:
     """SOL 101 Nastran scenario with one subcase per entry of subcases=[{"name", "load",
@@ -592,7 +605,7 @@ def _skill():
     return _SKILL["obj"]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def apex_scripting_guide(topic: str = "scripting-model") -> str:
     """Rules for writing Apex Python, from the apex-scripting skill. Read 'scripting-model' before the
     first run_apex_python of a session. Other topics: pitfalls, patterns-and-recipes,
@@ -606,7 +619,7 @@ async def apex_scripting_guide(topic: str = "scripting-model") -> str:
     return sk.guide(topic)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READS)
 async def apex_api_lookup(query: str, kind: str = "any", max_results: int = 5) -> str:
     """Exact Apex API signatures (Iberian Lynx FP2) from the apex-scripting skill's generated
     reference: 989 functions, 733 classes, 237 enums. query is a name ('createSurfaceMesh',
@@ -620,10 +633,44 @@ async def apex_api_lookup(query: str, kind: str = "any", max_results: int = 5) -
     return sk.lookup(query, kind=kind, max_results=max_results)
 
 
+@mcp.tool(annotations=READS)
+async def apex_describe(target: str = "apex", filter: Optional[str] = None, values: bool = True,
+                        limit: int = 200) -> str:
+    """What the RUNNING Apex has, read live (the API reference can be wrong: moved classes, enum
+    members it leaves out, undocumented functions), merged with the reference's signatures.
+    target:
+      * an API path: 'apex.mesh' (module: its functions, classes, enums; * marks names the
+        reference lacks), 'apex.mesh.createSolidMesh' (runtime and documented signature),
+        'apex.mesh.SurfaceMeshElementShape' (enum members with values), 'apex.Part' (class:
+        properties and methods), 'apex.Part.update' (method signature);
+      * an entity pathName from list_tree: its class, property values and methods;
+      * '$name' or '$name.attr': a variable left by run_apex_python (e.g. '$part', '$res.meshes').
+    filter keeps member names containing that text. values=False lists an object's properties
+    without reading them. Properties that can hold every element or node (elements, nodes,
+    ...entities, ...IDs) are never read. Read-only."""
+    res = await _bridge("describe", {"target": target, "filter": filter, "values": values, "limit": limit})
+    _SKILL["consulted"] = True  # grounded in the live API, like a lookup
+    return format_describe(res, _skill(), PF.load_overrides())
+
+
 # --------------------------------------------------------------------- raw
+def format_effects(eff, failed=False):
+    """One line: what the script changed in the model (see worker/effects.py)."""
+    if eff is None:
+        return None
+    if eff.get("error"):
+        return "effects: not tracked (%s)" % eff["error"]
+    body = {k: v for k, v in eff.items() if k not in ("seconds", "untracked")}
+    tail = " (not tracked: %s)" % ", ".join(eff["untracked"]) if eff.get("untracked") else ""
+    if not body:
+        return "effects: none" + tail
+    return ("effects before the error=" if failed else "effects=") + _json(body) + tail
+
+
 def format_script_result(res, show_log=False):
-    """Plain text for run_apex_python: stdout, then result=<compact JSON>, then the trimmed
-    traceback. JSON-wrapping the stdout would escape every newline and quote in it."""
+    """Plain text for run_apex_python: stdout, then result=<compact JSON>, then what the script
+    changed (effects), then the trimmed traceback. JSON-wrapping the stdout would escape every
+    newline and quote in it."""
     if not isinstance(res, dict) or "stdout" not in res:  # e.g. the worker's size cap fired
         return _json(res)
     parts = []
@@ -634,6 +681,9 @@ def format_script_result(res, show_log=False):
     if res.get("result_error"):
         parts.append("result not returned: %s\npreview: %s" % (res["result_error"], res.get("result_preview", "")))
     failed = bool(res.get("traceback"))
+    eff = format_effects(res.get("effects"), failed)
+    if eff:
+        parts.append(eff)
     if failed:
         parts.append(res["traceback"].rstrip("\n"))
     if failed or show_log:
@@ -642,14 +692,125 @@ def format_script_result(res, show_log=False):
     return "\n".join(parts) or "(ran, no output: print() or set result = ... to return something)"
 
 
-@mcp.tool()
-async def run_apex_python(code: str, attach: bool = True, show_log_path: bool = False) -> str:
-    """Run Python on Apex's script thread with the open Apex's `apex` module (keyword-only API).
-    Variables persist between calls. Returns plain text: print() output (last 20k chars), then
-    `result=<JSON>` if the script set `result = ...`, then on failure the script's traceback and
-    where the script was saved (every script is saved to output/scripts; show_log_path=True
-    reports the path on success too).
+def call_signatures(names, limit=3):
+    """API-reference signature lines for qualified function names ('apex.getEntities') or the
+    worker's call records ({'kind': 'method', 'class': 'Part', 'method': 'update', ...})."""
+    sk = _skill()
+    if sk is None:
+        return []
+    out = []
+    for n in names[:limit]:
+        if isinstance(n, dict) and n.get("kind") == "method":
+            sigs = sk.method_signature(n["class"], n["method"], n.get("bases", ()))
+            missing = ("%s: not in the API reference (apex_api_lookup('%s') lists what the class documents)"
+                       % (n["name"], n["class"]))
+        else:
+            label = n["name"] if isinstance(n, dict) else n
+            sigs = sk.signature(label)
+            missing = "%s: not in the API reference" % label
+        out += sigs or [missing]
+    return out
 
+
+_LIVE = {"index": None, "state": "untried"}  # untried | ok | unsupported
+
+
+async def live_api_index():
+    """The running Apex's own API names (worker/introspect.py), fetched once per server session.
+    None when the bridge's worker is too old to have api_index; preflight then uses the docs."""
+    if _LIVE["state"] == "untried":
+        try:
+            res = await _bridge("api_index", {})
+            with open(res["path"], "r", encoding="utf-8") as fh:
+                _LIVE["index"] = json.load(fh)
+            _LIVE["state"] = "ok"
+        except ToolError as exc:  # bridge down or busy: try again next time; anything else: docs only
+            if not any(m in str(exc) for m in ("Cannot reach", "busy", "Lost connection", "timed out", "did not answer")):
+                _LIVE["state"], _LIVE["error"] = "unsupported", str(exc)[:300]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            _LIVE["state"], _LIVE["error"] = "unsupported", str(exc)[:300]
+    return _LIVE["index"]
+
+
+async def run_preflight(code, mode="run"):
+    sk = _skill()
+    live = await live_api_index()
+    return PF.check(code, sk.doc_index() if sk is not None else None, live, mode=mode), live is not None
+
+
+def preflight_refusal(pf, live, mode="run"):
+    errs = pf["errors"]
+    names = []
+    for e in errs:
+        if e.get("name") and e["name"] not in names and "argument" in e["msg"]:
+            names.append(e["name"])
+    text = "Not run: preflight found %d problem(s) in the script:\n%s" % (len(errs), PF.format_issues(errs))
+    sigs = call_signatures(names)
+    if sigs:
+        text += "\n\nAPI reference:\n" + "\n".join("  " + x for x in sigs)
+    if pf["warnings"]:
+        text += "\n\nWarnings:\n" + PF.format_issues(pf["warnings"])
+    text += "\n\nNothing was sent to Apex. Fix the script and resend it."
+    if any(e.get("query") for e in errs):
+        text += (" The read-only checks cannot be forced: a script that changes the model or the scene, "
+                 "writes a file or starts a process belongs in run_apex_python.")
+    else:
+        text += (" If a check is wrong (Apex has the name or accepts the call), resend with force=True. "
+                 "apex_describe('apex.<module>') lists what this Apex has.")
+    if not live:
+        text += " Names were checked against the API reference only: the bridge did not provide a live index."
+    return text
+
+
+def effects_changed(eff):
+    """True when an effects receipt shows a change (not just timing or untracked sections)."""
+    return isinstance(eff, dict) and any(k in eff for k in ("created", "deleted", "changed", "model_switched"))
+
+
+async def _run_script(code, mode, attach=True, show_log_path=False, force=False, effects=True):
+    """run_apex_python and query_apex_python: skill gate, preflight, run, then the result text."""
+    cfg = load_config()
+    sk = _skill()
+    query = mode == "query"
+    if sk is not None and cfg.get("require_skill_lookup", True) and not _SKILL["consulted"]:
+        raise ToolError("Not run. Read apex_scripting_guide('scripting-model') first, and check the "
+                        "apex calls in this script with apex_api_lookup, then resend it. (Enforced once per "
+                        "session; set require_skill_lookup to false in config.json to turn it off.)")
+    pf = None
+    if cfg.get("script_preflight", True) or query:  # the read-only check is what makes a query a query
+        pf, live = await run_preflight(code, mode)
+        if pf["errors"] and (not force or any(e.get("query") for e in pf["errors"])):
+            raise ToolError(preflight_refusal(pf, live, mode))
+    track = bool(effects and cfg.get("script_effects", True))  # the worker snapshots a query regardless
+    res = await _bridge("run_apex_python", {"code": code, "attach": attach or query, "effects": track, "mode": mode})
+    out = format_script_result(res, show_log_path)
+    eff = res.get("effects") if isinstance(res, dict) else None
+    if query and effects_changed(eff):  # the static check missed something: say so first, loudly
+        out = ("WARNING: this query CHANGED THE MODEL (not undone; see effects= below). The read-only check "
+               "missed it: tell the user what changed. Use run_apex_python for scripts that change things.\n\n" + out)
+    elif query and isinstance(eff, dict) and eff.get("error"):
+        out += "\n(could not confirm that the query changed nothing: %s)" % eff["error"]
+    err = res.get("error") if isinstance(res, dict) else None
+    if err and err.get("calls"):
+        sigs = call_signatures(err["calls"])
+        if sigs:
+            out += "\n\nAPI reference for the failing call%s:\n%s" % (
+                "s" if len(sigs) > 1 else "", "\n".join("  " + x for x in sigs))
+    if pf is not None and (pf["warnings"] or (force and pf["errors"])):
+        notes = (pf["errors"] if force else []) + pf["warnings"]
+        out += "\n\npreflight%s:\n%s" % (" (forced past)" if force and pf["errors"] else " warnings",
+                                         PF.format_issues(notes))
+    if sk is None:
+        return "NOTE: %s\n\n%s" % (NO_SKILL, out)
+    # script errors come back as a result with a traceback, not as a ToolError
+    if isinstance(res, dict) and res.get("traceback") and not _SKILL["reminded"]:
+        _SKILL["reminded"] = True  # once per session
+        out += ("\n\nThe script raised. Before retrying, look up the failing call with apex_api_lookup "
+                "(and apex_scripting_guide('pitfalls')) instead of guessing a new signature.")
+    return out
+
+
+SCRIPT_RULES = """
     MEMORY RULES - Apex shares this process with the user's model:
     * Never iterate part.elements / part.nodes / mesh.elements / mesh.nodes, and never read
       per-element attributes (material, elementProperty2D, ...) across a whole mesh.
@@ -663,31 +824,65 @@ async def run_apex_python(code: str, attach: bool = True, show_log_path: bool = 
       Q.nodes_on_face(face_or_faces, ids_only=False), Q.nodes_where(mesh_or_part, fn) with
       fn(xyz Nx3 numpy) -> bool mask, Q.nodes_by_id(part, ids), Q.node_near(part, xyz, tol),
       Q.rle(ids) -> '1-3,7-7' for getNodes/getElements(ids=...), Q.face_shape(face).
-    * Model changes: confirm with the user first. The builder tools (create_material, mesh_solid,
-      glue, rbe2, beam, constrain, nodal_load, static_scenario, ...) cover the common steps.
 
     API RULES - generated Apex code usually fails on these:
-    * Every argument by keyword; Apex accepts no positional arguments.
-    * Change entity properties with entity.update(...); plain assignment silently does nothing.
-    * Pass targets as apex.EntityCollection (appendList), use .len() not len().
-    * Confirm calls, enum members and properties with apex_api_lookup first. The first call of a
-      session is refused until apex_scripting_guide or apex_api_lookup has been used."""
-    cfg = load_config()
-    sk = _skill()
-    if sk is not None and cfg.get("require_skill_lookup", True) and not _SKILL["consulted"]:
-        raise ToolError("Not run. Read apex_scripting_guide('scripting-model') first, and check the "
-                        "apex calls in this script with apex_api_lookup, then resend it. (Enforced once per "
-                        "session; set require_skill_lookup to false in config.json to turn it off.)")
-    res = await _bridge("run_apex_python", {"code": code, "attach": attach})
-    out = format_script_result(res, show_log_path)
-    if sk is None:
-        return "NOTE: %s\n\n%s" % (NO_SKILL, out)
-    # script errors come back as a result with a traceback, not as a ToolError
-    if isinstance(res, dict) and res.get("traceback") and not _SKILL["reminded"]:
-        _SKILL["reminded"] = True  # once per session
-        out += ("\n\nThe script raised. Before retrying, look up the failing call with apex_api_lookup "
-                "(and apex_scripting_guide('pitfalls')) instead of guessing a new signature.")
-    return out
+    * Pass arguments by keyword: Apex also accepts positional ones, but keywords are what the
+      API reference documents and what preflight checks.
+    * Change entity properties with entity.update(...); plain assignment raises AttributeError.
+    * Pass targets as apex.EntityCollection (appendList).
+    * Confirm calls, enum members and properties with apex_api_lookup or apex_describe first. The
+      first script of a session is refused until one of apex_scripting_guide, apex_api_lookup or
+      apex_describe has been used."""
+
+
+QUERY_DOC = """READ-ONLY Python on Apex's script thread, for anything the summary tools do not cover:
+    counting, measuring, collecting ids, checking properties. Same namespace, output and preflight
+    as run_apex_python (variables persist between the two), but the script is refused before it
+    runs if it would change anything:
+    * an apex function that is not a read (getX, isX, asX, evaluateX, measureX, findX ... are
+      reads; createX, deleteEntities, setX, assignX, display.render, undo ... are not);
+    * a method that changes an entity or the scene (update, setX, createX, removeX, hide, show,
+      highlight, save ...), except on a dict the script builds itself ({...}, dict());
+    * writing a file (open(.., 'w'), np.save, Path.write_text ...), os.remove / os.system, imports
+      of subprocess, shutil, socket, ctypes ..., and exec / eval / setattr.
+    Adding to an EntityCollection or a list is fine. The model is snapshotted before and after: if
+    the script changed it anyway, the result starts with a WARNING and the effects. force=True gets
+    past the ordinary preflight errors, never the read-only ones. To change the model use
+    run_apex_python; for the view use viewport / screenshot.
+""" + SCRIPT_RULES
+
+
+@mcp.tool(annotations=READS, description=QUERY_DOC)
+async def query_apex_python(code: str, show_log_path: bool = False, force: bool = False) -> str:
+    return await _run_script(code, "query", show_log_path=show_log_path, force=force)
+
+
+RUN_DOC = """Run Python on Apex's script thread that CHANGES the model or the scene; for scripts that
+    only read, use query_apex_python (refused if it would change anything, so it is safe to allow).
+    Variables persist between calls of both. Returns plain text: print() output (last 20k chars),
+    then `result=<JSON>` if the script set `result = ...`, then `effects=` (what the script
+    created, deleted or changed in the model: parts, assemblies, solid/surface/curve/mesh/element/
+    node counts, loads, constraints, connections, materials, properties, scenarios; `effects: none`
+    when it changed none of these), then on failure the script's traceback, the API signature of
+    the failing apex call and where the script was saved (every script is saved to output/scripts;
+    show_log_path=True reports the path on success too).
+
+    PREFLIGHT: the script is checked before anything is sent to Apex, without running it. It is
+    refused (nothing runs) for a syntax error, an apex name or enum member this Apex does not
+    have, a keyword argument the function does not take or a missing required one, and a loop
+    over .elements / .nodes. Other findings come back as warnings with the output. force=True
+    runs a refused script anyway. effects=False skips the model snapshots before and after (about
+    50 ms on a small model, capped by effects_budget_s on a large one).
+
+    Model changes: confirm with the user first. The builder tools (create_material, mesh_solid,
+    glue, rbe2, beam, constrain, nodal_load, static_scenario, ...) cover the common steps.
+""" + SCRIPT_RULES
+
+
+@mcp.tool(annotations=CHANGES, description=RUN_DOC)
+async def run_apex_python(code: str, attach: bool = True, show_log_path: bool = False, force: bool = False,
+                          effects: bool = True) -> str:
+    return await _run_script(code, "run", attach, show_log_path, force, effects)
 
 
 def main():

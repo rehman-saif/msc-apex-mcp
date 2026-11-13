@@ -33,6 +33,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import builders as B  # noqa: E402
+import effects as FX  # noqa: E402
+import introspect as IN  # noqa: E402
 import queries as Q  # noqa: E402
 import scene as SC  # noqa: E402
 import serialize as S  # noqa: E402
@@ -40,6 +42,7 @@ import serialize as S  # noqa: E402
 # Files whose copies must match between the MCP server and the bridge (apex_status compares them).
 DEPLOYED_FILES = ["apex_mcp/worker/apex_worker.py", "apex_mcp/worker/queries.py",
                   "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py", "apex_mcp/worker/scene.py",
+                  "apex_mcp/worker/effects.py", "apex_mcp/worker/introspect.py",
                   "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_worker.py",
                   "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_ui.py"]
 
@@ -60,7 +63,7 @@ MODE = {"inprocess": False, "log_file": None}
 STATE = {"attached": False, "pid": None, "ns": None, "apex": None}
 
 DEFAULTS = {"query_time_budget_s": 20.0, "max_items": 200, "max_response_kb": 256,
-            "max_highlight_ids": 20000}
+            "max_highlight_ids": 20000, "effects_budget_s": 5.0, "effects_mesh_counts": True}
 
 
 # ------------------------------------------------------------------ util
@@ -558,6 +561,49 @@ def script_traceback(exc):
     return "".join(lines + traceback.format_exception_only(type(exc), exc))
 
 
+def script_error(exc, code):
+    """{type, message, line, source, calls}: where the script failed and which apex calls are on
+    that line, resolved in the failing frame (so the server can attach their signatures)."""
+    info = {"type": type(exc).__name__, "message": str(exc)[:600]}
+    last, tb = None, exc.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename == SCRIPT:
+            last = tb
+        tb = tb.tb_next
+    if last is None:
+        line = getattr(exc, "lineno", None) if isinstance(exc, SyntaxError) else None
+        if line:
+            info["line"] = line
+        return info
+    info["line"] = last.tb_lineno
+    lines = code.splitlines()
+    if 0 < last.tb_lineno <= len(lines):
+        info["source"] = lines[last.tb_lineno - 1].strip()[:300]
+    try:
+        info["calls"] = IN.failing_calls(code, last.tb_lineno, last.tb_frame, ensure_apex(),
+                                         position=IN.tb_position(last))
+    except Exception as e:  # never let the diagnosis hide the error itself
+        info["calls_error"] = str(e)[:200]
+    return info
+
+
+def _snapshot():
+    try:
+        return FX.snapshot(sys.modules[__name__], float(cfg("effects_budget_s")), bool(cfg("effects_mesh_counts")))
+    except Exception as exc:
+        log("effects snapshot failed", exc)
+        return {"failed": str(exc)[:200]}
+
+
+def _effects(before):
+    if "failed" in before:
+        return {"error": "snapshot before the script failed: " + before["failed"]}
+    after = _snapshot()
+    if "failed" in after:
+        return {"error": "snapshot after the script failed: " + after["failed"]}
+    return FX.receipt(before, after)
+
+
 def m_run_apex_python(p):
     if STATE["ns"] is None:
         STATE["ns"] = {"__name__": "__mcp__"}
@@ -567,21 +613,29 @@ def m_run_apex_python(p):
     if p.get("attach", True):
         ns["apex"] = ensure_apex()
     code = p["code"]
-    log_path = os.path.join(out_dir("scripts"), "script_%s.py" % stamp())
+    query = p.get("mode") == "query"  # query_apex_python: the server checked it reads only
+    log_path = os.path.join(out_dir("scripts"), "%s_%s.py" % ("query" if query else "script", stamp()))
     with open(log_path, "w", encoding="utf-8") as fh:
-        fh.write("# run_apex_python %s\n%s\n" % (datetime.datetime.now().isoformat(), code))
+        fh.write("# %s %s\n%s\n" % ("query_apex_python" if query else "run_apex_python",
+                                    datetime.datetime.now().isoformat(), code))
     # source for the traceback lines (mtime None: linecache.checkcache leaves it alone)
     linecache.cache[SCRIPT] = (len(code), None, code.splitlines(True), SCRIPT)
     ns.pop("result", None)
+    # a query is always snapshotted: the receipt is what shows it really changed nothing
+    track = (query or bool(p.get("effects", True))) and p.get("attach", True)
+    before = _snapshot() if track else None
     buf = io.StringIO()
-    err = None
+    err = info = None
     t0 = time.time()
     with contextlib.redirect_stdout(buf):
         try:
             exec(compile(code, SCRIPT, "exec"), ns)  # noqa: S102 - the user asked for a raw tool
         except BaseException as exc:  # sys.exit() too: its output and error must still come back
             err = script_traceback(exc)
+            info = script_error(exc, code)
     out = {"stdout": buf.getvalue()[-20000:], "seconds": round(time.time() - t0, 3), "logged_to": log_path}
+    if before is not None:  # also after a failure: a script that raised halfway may have changed things
+        out["effects"] = _effects(before)
     if "result" in ns:
         res = S.to_json(ns["result"], depth=4)
         size_kb = len(json.dumps(res, default=str)) / 1024.0
@@ -595,6 +649,7 @@ def m_run_apex_python(p):
             out["result"] = res
     if err:
         out["traceback"] = err[-8000:]
+        out["error"] = info
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write("\n# --- outcome: %s, %.3fs\n" % ("error" if err else "ok", out["seconds"]))
     return out
@@ -603,6 +658,7 @@ def m_run_apex_python(p):
 METHODS = {name[2:]: fn for name, fn in globals().items() if name.startswith("m_") and callable(fn)}
 METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in B.TOOLS.items()})
 METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in SC.TOOLS.items()})
+METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in IN.TOOLS.items()})
 
 
 def handle_request(req):
@@ -625,5 +681,7 @@ def handle_request(req):
         return {"id": rid, "ok": True, "result": res}
     except BaseException as exc:
         log("error", method, exc)
+        if getattr(exc, "quiet", False):  # an expected refusal or lookup miss: the message says it all
+            return {"id": rid, "ok": False, "error": str(exc)}
         return {"id": rid, "ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc()[-6000:]}

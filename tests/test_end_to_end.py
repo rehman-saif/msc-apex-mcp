@@ -108,16 +108,41 @@ async def main():
             assert "apex.mesh.ElementTopology" in t
             t = await call("apex_api_lookup", query="apex.mesh.CurveMesh", kind="class")
             assert "update(name: str, meshSize: float" in t
+            # apex_describe: live names merged with the reference; element collections are never read
+            t = await call("apex_describe", target="Model/PID53", show=200)
+            assert "name = 'PID53'" in t and "not read" in t and "elements" in t and "AssertionError" not in t, t
+            t = await call("apex_describe", target="apex.getEntities")
+            assert "runtime:   apex.getEntities(pathNames = None)" in t and "reference: apex.getEntities(pathNames: [str])" in t, t
+            t = await call("apex_describe", target="apex.getEntitie", expect_error=True)
+            assert "apex has no 'getEntitie'" in t and "getEntities" in t and "traceback" not in t, t
+            await call("run_apex_python", code="part = apex.getPart(pathName='Model/PID54')")
+            t = await call("apex_describe", target="$part", filter="mesh")
+            assert "Model/PID54" in t and "getMeshes" in t, t
+            t = await call("apex_describe", target="$part.nodes", expect_error=True)
+            assert "bulk getters" in t and "traceback" not in t, t
+            t = await call("apex_describe", target="Model/NoSuchPart", expect_error=True)
+            assert "no entity 'Model/NoSuchPart'" in t and "traceback" not in t, t
             await call("run_apex_python", code="result = Q.mesh_summary(apex.currentModel().getParts()[0].getMeshes()[0], sample=2)")
             t = await call("run_apex_python", code="result = {'big': 'x' * 200000}")
             assert "result too large" in t
             # M2/M4: plain text, no JSON wrapper, no log path on success
             t = await call("run_apex_python", code='print("a\\nb \\"q\\"")\nresult = {"x": [1, 2]}')
-            assert t == 'a\nb "q"\nresult={"x":[1,2]}', repr(t)
+            assert t == 'a\nb "q"\nresult={"x":[1,2]}\neffects: none', repr(t)
+            # effects receipt: what a script created and deleted
+            t = await call("run_apex_python", code="p = apex.currentModel().createPart(name='Tmp')\nresult = p.pathName")
+            assert 'effects={"created":{"parts":["Model/Tmp"]}}' in t, t
+            t = await call("run_apex_python", code="apex.PARTS.remove(p)", effects=True)
+            assert 'effects={"deleted":{"parts":["Model/Tmp"]}}' in t, t
+            t = await call("run_apex_python", code="x = 1", effects=False)
+            assert "effects" not in t, t
+            # preflight: refused before Apex runs it, with the documented signature
+            t = await call("run_apex_python", code="ran = 1\napex.getEntities(paths=['Model/PID53'])", expect_error=True)
+            assert "Not run: preflight" in t and "has no argument 'paths'" in t and "Did you mean pathNames" in t, t
+            assert "apex.getEntities(pathNames: [str])" in t, t
             # M1: a script's own Q / S survive the next call; the helpers stay importable
             await call("run_apex_python", code="S = 5\nQ = 'mine'")
             t = await call("run_apex_python", code="import queries\nresult = [S + 1, Q, queries.rle([3, 4, 5, 9])]")
-            assert t == 'result=[6,"mine","3-5,9-9"]', t
+            assert t == 'result=[6,"mine","3-5,9-9"]\neffects: none', t
             await call("run_apex_python", code="import queries as Q")
             # M6: public Q helpers
             t = await call("run_apex_python", code=(
@@ -127,7 +152,7 @@ async def main():
                 "result = [faces.len(), Q.nodes_on_face(faces, ids_only=True),\n"
                 "          Q.nodes_where(mesh, lambda p: p[:, 0] < 0.025, ids_only=True),\n"
                 "          Q.nodes_where(mesh, lambda p: p[:, 0] < 0.015).len(), Q.face_shape(faces[0])[0]]"))
-            assert t == 'result=[2,[1,2,3,4],[1,2,3],2,"cyl"]', t
+            assert t == 'result=[2,[1,2,3,4],[1,2,3],2,"cyl"]\neffects: none', t
             # M3: trimmed traceback (script frames only) and the reminder only once
             t = await call("run_apex_python", code="x = 1\napex.mesh.noSuchFunction(x=1)", show=400)
             assert 'File "<script>", line 2' in t and "AttributeError" in t and "apex_worker" not in t, t
@@ -137,6 +162,34 @@ async def main():
             # sys.exit reaches the client with its output, through the real worker entry point
             t = await call("run_apex_python", code="import sys\nprint('kept')\nsys.exit(2)", show=200)
             assert "kept" in t and "SystemExit: 2" in t, t
+            # a runtime failure gets the failing call's signature, and the effects made before it
+            t = await call("run_apex_python", code=(
+                "p = apex.currentModel().createPart(name='Half')\n"
+                "apex.getEntities(pathNames=5)"), show=900)
+            assert "TypeError" in t and "API reference for the failing call:\n  apex.getEntities(pathNames: [str])" in t, t
+            assert 'effects before the error={"created":{"parts":["Model/Half"]}}' in t, t
+            await call("run_apex_python", code="apex.PARTS.remove(p)")
+            # query_apex_python: reads run; changes are refused before Apex sees them, even with force
+            t = await call("query_apex_python", code="result = [p.name for p in apex.currentModel().getParts()][:1]",
+                           show_log_path=True)
+            assert t.startswith('result=["') and "effects: none" in t and "query_" in t, t
+            t = await call("query_apex_python", code="p = apex.currentModel().createPart(name='Q')", expect_error=True)
+            assert "createPart() changes the model" in t and "cannot be forced" in t, t
+            t = await call("query_apex_python", code="apex.getPart(pathName='Model/PID53').update(name='x')",
+                           force=True, expect_error=True)
+            assert ".update(...) changes an Apex entity" in t, t
+            # what the static check cannot see, the snapshot catches
+            await call("run_apex_python", code="p = apex.currentModel().createPart(name='Tmp2')")
+            t = await call("query_apex_python", code="apex.PARTS.remove(p)")
+            assert t.startswith("WARNING: this query CHANGED THE MODEL") and '"deleted":{"parts":["Model/Tmp2"]}' in t, t
+            cfg["script_effects"] = False  # a query is snapshotted anyway: that is its proof
+            json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
+            t = await call("query_apex_python", code="x = 3")
+            assert t == "effects: none", t
+            t = await call("run_apex_python", code="x = 3")
+            assert "effects" not in t, t
+            cfg.pop("script_effects")
+            json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
             # config.json edits apply on the next call, without Stop/Start
             cfg["max_items"] = 77
             json.dump(cfg, open(os.path.join(PROJ, "config.json"), "w"))
@@ -187,8 +240,11 @@ async def main():
             assert t["sol"] == "101" and "SUBCASE 1" in t["case_control"] and t["cards"]["GRID"] == 2, t
             lint = " | ".join(t["lint"])
             assert "no load card has set id" in lint and "also SPC'd" in lint, lint
-            await call("run_apex_python", code="for e in apex.currentModel().getParts()[0].elements: pass",
-                       show=120, probe=True)  # forbidden walk is caught and reported, Apex side survives
+            walk = "for e in apex.currentModel().getParts()[0].elements: pass"
+            t = await call("run_apex_python", code=walk, expect_error=True, show=160)  # preflight refuses it
+            assert "iterates apex.currentModel().getParts()[0].elements" in t and "force=True" in t, t
+            await call("run_apex_python", code=walk, force=True,
+                       show=120, probe=True)  # forced: the fake's guard catches the walk, Apex side survives
             ui.on_stop(); time.sleep(0.5)
             await call("apex_status", expect_error=True)
             ui.on_start(); time.sleep(0.3)
