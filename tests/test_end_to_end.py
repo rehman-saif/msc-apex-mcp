@@ -40,6 +40,12 @@ async def main():
             for gone in ("contour", "deform", "probe", "clear_plots", "attach_results", "results_top_n"):
                 if gone in names:
                     FAIL.append("post tool still present: " + gone)
+            for gone in ("visibility", "set_view", "display_options", "highlight", "annotate", "cut_view"):
+                if gone in names:
+                    FAIL.append("viewport tool not folded into viewport/screenshot: " + gone)
+            for need in ("viewport", "screenshot"):
+                if need not in names:
+                    FAIL.append("missing tool: " + need)
 
             async def call(tool, expect_error=False, show=300, probe=False, **a):
                 res = await s.call_tool(tool, a)
@@ -76,10 +82,20 @@ async def main():
             assert t["cols"][:2] == ["id", "kind"] and rows and all(r[1] == "cyl" and abs(r[5] - 5.0) < 1e-6 for r in rows), t
             t = json.loads(await call("list_faces", paths=["Model/PID54"], normal=[0, 0, -1], near=[0, 0, 0], radius=0.1))
             assert {r[0] for r in t["parts"][0]["rows"]} == {101}, t
-            await call("visibility", action="show_only", paths=["Model/PID54"])
-            await call("set_view", view="iso1", zoom=1.2)
-            await call("highlight", part_path="Model/PID53", ids=[1, 2, 3])
+            t = json.loads(await call("viewport", scene={"show_only": ["Model/PID54"], "style": {"mesh_edges": False},
+                                                         "highlight": [{"part_path": "Model/PID53", "ids": [1, 2, 3]}]},
+                                      view={"preset": "iso1", "zoom": 1.2}, save_view="Iso A"))
+            assert "show_only" in t["applied"] and t["saved_views"].keys() == {"Iso A"}, t
+            await call("viewport", scene={"show_all": True, "clear_highlights": True,
+                                          "labels": [{"text": "tip", "at": [0, 0, 0]}]})
+            await call("viewport", scene={"labels": [], "clear_labels": True}, view="top")
             await call("screenshot", max_width=600)
+            t = json.loads(await call("screenshot", scene={"show_only": ["Model/PID53"], "style": {"color_by_part": True}},
+                                      views=["iso1", {"saved": "Iso A"}, {"preset": "y", "zoom": 1.5}], max_width=600,
+                                      show=2000))
+            assert len(t["views"]) == 3 and t["sheet"] and t["restored"] and not t["warnings"], t
+            await call("screenshot", scene={"show_only": ["Model/NOPE"]}, expect_error=True)
+            await call("viewport", delete_view="Iso A")
             t = await call("run_apex_python", code="result = 1", expect_error=True)  # gate: no lookup yet
             assert "apex_scripting_guide" in t, t
             t = await call("apex_scripting_guide", topic="pitfalls")

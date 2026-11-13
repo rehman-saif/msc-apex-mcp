@@ -8,7 +8,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI assistants (Claude
 - **Check geometry:** slivers, small edges and faces, gaps and cracks, reported without repairs.
 - **Build models:** materials, solid properties, meshing, glue, RBE2, beams, constraints, nodal loads and static scenarios.
 - **Check decks:** exports a BDF and returns a compact summary with lint warnings.
-- **Drive the viewport:** visibility, views, highlights, section cuts and screenshots.
+- **Drive the viewport:** isolate or hide parts, colour them, take several views in one labelled screenshot, save named views.
 - **Run Apex Python:** with an API lookup and scripting guide so the assistant writes correct calls.
 
 ## Requirements
@@ -60,7 +60,7 @@ Re-run `setup.bat` at any time to update the skills.
    - *"Summarise the parts in my model and check the geometry for faults."*
    - *"Mesh the bracket with 3 mm tets, constrain the bolt holes and apply 500 N on the top face."*
    - *"Export the static scenario and tell me if the deck has problems."*
-   - *"Hide everything except the housing and take a screenshot."*
+   - *"Show only the housing, colour each part differently and give me iso, front and top views."*
 4. Press **Stop** when you're done.
 
 The bridge serves one client at a time; close other sessions connected to the same Apex first.
@@ -95,11 +95,53 @@ MSC Apex ── MCP palette ── "MCP Bridge" tool    (listener inside Apex)
 | Model (read-only) | `list_tree`, `part_summary`, `geometry_check`, `get_entity`, `find_entities`, `list_faces`, `list_connections`, `list_loads_constraints`, `list_catalog`, `list_scenarios` |
 | Model building | `import_fe_model`, `create_material`, `assign_solid_property`, `mesh_solid`, `glue`, `rbe2`, `beam`, `constrain`, `nodal_load`, `static_scenario` |
 | Deck | `export_bdf` |
-| Viewport | `visibility`, `set_view`, `display_options`, `highlight`, `annotate`, `cut_view`, `screenshot` |
+| Viewport | `viewport`, `screenshot` (see below) |
 | Apex API help | `apex_api_lookup`, `apex_scripting_guide` |
 | Raw | `run_apex_python` |
 
 Builder tools are idempotent: calling one again with the same name replaces what it made before.
+
+### Viewport and screenshots
+
+`viewport` and `screenshot` take the same **scene** description (everything optional):
+
+```jsonc
+{
+  "show_only": ["base/Assembly/Housing"],   // or show / hide / show_all / hide_all: parts, assemblies, solids, surfaces
+  "style": {"color_by_part": true,          // parts often share one colour; or "color": {"<path>": [r,g,b]}
+            "render_style": "ShadedWithEdges", "transparency": {"<path>": 40},
+            "mesh_edges": false, "loads_bc_markers": true, "connection_markers": true},
+  "highlight": [{"paths": ["..."]}, {"part_path": "...", "ids": [1, 2, 3], "kind": "Element"}],
+  "labels": [{"text": "bolt", "at": [0, 0, 10]}],
+  "cut": {"location": [0, 0, 5]}
+}
+```
+
+- **`viewport(scene, view, save_view, delete_view, list_views)`** applies the scene and leaves it applied. `view` is a
+  preset, a saved view or `{preset|saved, zoom}`.
+- **`screenshot(scene, views, layout, crop, margin, max_width, restore)`** applies the scene, takes up to 9 views, and
+  puts your scene and camera back. `layout: "sheet"` (default) returns one labelled grid, `"separate"` one image each.
+- **Views:** presets `iso1`-`iso4`, `x`, `-x`, `y`, `-y`, `z`, `-z` and `right` (+X), `left` (-X), `back` (+Y), `front`
+  (-Y), `top` (+Z), `bottom` (-Z), named for the side the camera is on. Apex fits a preset to what is visible, so
+  `show_only` a part to frame it. For any other angle set the view up in Apex and `save_view` it.
+
+How it behaves, measured on Apex 2024.1:
+
+- Apex's `captureImage` grabs **screen pixels**, so a window on top of Apex ends up in the picture. Before each capture
+  the tool checks whether anything covers Apex's window and raises it (without taking keyboard focus); an always-on-top
+  window cannot be raised over and is reported as an error. Set `screenshot_bring_to_front` to `false` to get an error
+  instead of raising the window.
+- An empty or unreadable capture (for example with Apex's UI hidden, where Apex itself writes a 0-byte file) is retried
+  and then reported.
+- `crop: "model"` (default) removes the floating panels by comparing against a frame with everything hidden and cropping
+  to the model; where the model runs under a panel the panel stays. `margin` (default 0.85) zooms presets out a little
+  so the model clears the panels; `1.0` is Apex's tight fit.
+- Visibility changes use parts and entities, not `session.hideAll()`, and are restored exactly (assemblies, parts, and
+  the entities inside them). **Not restorable** because Apex cannot read them back: marker/edge toggles, highlights and
+  cut views. A screenshot lists what it used under `not_restored`.
+- There is no free rotation, pan or camera-position input: the camera's coordinates and parallel scale are not model
+  units in Apex, and rotating about the focal point throws a part out of frame. Presets, `zoom` and saved views are
+  the supported, reliable ways to move the camera.
 
 ## Configuration
 
@@ -109,7 +151,9 @@ Settings live in `config.json` (created by `setup.bat` from `config.example.json
 |---|---|
 | `bridge_port` / `bridge_token` | Where the bridge listens and its shared secret |
 | `script_unit_system` | e.g. `mm-t-s-N-K`; empty leaves Apex's units alone |
-| `output_dir` | Screenshots, saved scripts, exported decks and logs |
+| `output_dir` | Screenshots, saved views, saved scripts, exported decks and logs |
+| `screenshot_max_width` | Width cap for screenshots (default 1400) |
+| `screenshot_bring_to_front` | Raise Apex's window when something covers it before a capture (default `true`) |
 | `call_timeout_s` | Maximum wait for one Apex call (default 300) |
 | `query_time_budget_s` / `max_items` / `max_response_kb` | Limits that keep queries small and fast |
 | `require_skill_lookup` | Require an API lookup before the first raw script (default `true`) |
@@ -129,6 +173,7 @@ you press **Start** again.
 .venv\Scripts\pip install -r requirements-dev.txt
 .venv\Scripts\python tests\test_units.py
 .venv\Scripts\python tests\test_bridge.py
+.venv\Scripts\python tests\test_scene.py
 .venv\Scripts\python tests\test_end_to_end.py
 ```
 

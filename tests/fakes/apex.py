@@ -87,6 +87,15 @@ class Face(Named):
 
 class Solid(Named):
     entityType = "EntityType.Solid"
+    vis, parent, writes = "Visible", None, []  # writes: every explicit show()/hide() call, for the tests
+    def getVisibility(self): return "Visibility." + self.vis
+    def show(self): self._set("Visible")
+    def hide(self): self._set("Hidden")
+    def _set(self, v):
+        Solid.writes.append((self.pathName, v))
+        self.vis = v
+        if self.parent is not None and self.parent._cascading is False:
+            self.parent.vis = "NotSet"  # like Apex: an explicit change on a child makes the container NotSet (-1)
     def getVolume(self): return 1234.5
     def getFaces(self): return Coll([Face(10.0, id=101, centroid=(0, 0, 0)),
                                      Face(0.001, id=102, centroid=(0, 0, 0.5), cyl_r=5.0, node_ids=(2, 3, 4))])
@@ -153,6 +162,10 @@ class Mesh(Named):
         return next(Node(i, p) for i, p in zip(self.ids, self.xyz) if i == id)
 
 
+_RENDER = {"E." + n: i for i, n in enumerate(
+    ("Wireframe", "HiddenLines", "Filled", "FilledWithEdges", "Shaded", "ShadedWithEdges"))}
+
+
 class Part(Named):
     entityType = "EntityType.Part"
     elements = _Forbidden()
@@ -160,15 +173,32 @@ class Part(Named):
     def __init__(self, name, path, meshes=(), solids=(), surfaces=()):
         super().__init__(name, path)
         self._m, self._so, self._su, self.vis = Coll(meshes), Coll(solids), Coll(surfaces), "Visible"
+        self.color, self.render, self.transp = [255, 255, 0], "-5", 0  # "-5": render style not set
+        self._cascading, self.asm = False, None
+        for so in self._so: so.parent = self
     def getMeshes(self): return Coll(self._m)
     def getSolids(self): return self._so
     def getSurfaces(self): return self._su
     def getVisibility(self): return "Visibility." + self.vis
-    def show(self): self.vis = "Visible"
-    def hide(self): self.vis = "Hidden"
+    def _cascade(self, v):  # like Apex: a container cascades to its children, and stays Visible/Hidden
+        self.vis, self._cascading = v, True
+        for so in self._so: so._set(v)
+        self._cascading = False
+        if self.asm is not None and not self.asm._cascading:
+            self.asm.vis = "NotSet"  # changing one part alone makes its assembly NotSet, and it stays so
+    def show(self): self._cascade("Visible")
+    def hide(self): self._cascade("Hidden")
     def showOnly(self): self.vis = "Visible"
     def highlight(self, colorRGB=None): pass
-    def update(self, **kw): self.kw = kw
+    def getColor(self): return list(self.color)
+    def getDisplayRenderStyle(self): return self.render
+    def getDisplayTransparency(self): return self.transp
+    def unsetRender(self): self.render = "-5"
+    def update(self, **kw):
+        self.kw = kw
+        if "color" in kw: self.color = list(kw["color"])
+        if "renderStyle" in kw: self.render = str(_RENDER.get(kw["renderStyle"], "-5"))
+        if "transparencyLevel" in kw: self.transp = kw["transparencyLevel"]
 
 
 P53 = Part("PID53", "Model/PID53", meshes=[Mesh("skin", 90000), Mesh("longeron", 500, first_id=200000)], surfaces=[Surface("s1")])
@@ -177,11 +207,29 @@ P54 = Part("PID54", "Model/PID54", solids=[Solid("bracket_%d" % i, "Model/PID54/
 PARTS = [P53, P54]
 
 
+ASSEMBLIES = []  # empty unless a test adds one
+
+
+class Assembly(Named):
+    entityType = "EntityType.Assembly"
+    def __init__(self, name, parts):
+        super().__init__(name, "Model/" + name)
+        self.parts, self.vis, self._cascading = list(parts), "Visible", False
+        for p in self.parts: p.asm = self
+    def getVisibility(self): return "Visibility." + self.vis
+    def _cascade(self, v):
+        self.vis, self._cascading = v, True
+        for p in self.parts: p._cascade(v)
+        self._cascading = False
+    def show(self): self._cascade("Visible")
+    def hide(self): self._cascade("Hidden")
+
+
 class Model(Part):
     entityType = "EntityType.Model"
     current = None
     def getParts(self, recursive=False): return Coll(PARTS)
-    def getAssemblies(self, recursive=False): return Coll()
+    def getAssemblies(self, recursive=False): return Coll(ASSEMBLIES)
     def createPart(self, *, name):
         p = Part(name, self.pathName + "/" + name); PARTS.append(p); return p
     def setCurrentPart(self, *, pathName):
@@ -197,7 +245,8 @@ def getScriptUnitSystemLabel(): return "mm-kg-s-N"
 def getApplicationUnitSystemLabel(): return "mm-kg-s-N"
 def getCurrentProjectFolderPath(): return "C:/fake"
 def setScriptUnitSystem(unitSystemName=None): pass
-def getEntities(pathNames=None): return Coll([e for e in PARTS + [_M] if e.pathName in pathNames])
+def getEntities(pathNames=None):
+    return Coll([e for e in PARTS + [_M] + [so for pt in PARTS for so in pt._so] if e.pathName in pathNames])
 def get(target=None): return Coll([Element("el", id=1)])
 def getPart(*, pathName): return next((p for p in PARTS if p.pathName == pathName), None)
 def getAssembly(*, pathName): return _M if pathName == _M.pathName else None
@@ -313,25 +362,101 @@ def getPrimaryStudy(): return Study()
 studies = types.SimpleNamespace(NastranSolutionType=_Enum("Statics_101"), NastranAnalysisType=_Enum("Statics"))
 ColorRGB = lambda r, g, b: (r, g, b)  # noqa: E731
 AutoManual = _Enum("Auto", "Manual")
-session = types.SimpleNamespace(showAll=lambda: None, hideAll=lambda: None, clearHighlights=lambda: None,
-                                DisplayRenderStyle=_Enum("Shaded", "Wireframe"),
-                                displayConnectionMarkers=lambda display: display)
+CALLS = []  # display/session calls the tests assert on
+
+
+def _show_all():
+    for p in PARTS: p.show()
+
+
+def _hide_all():
+    CALLS.append("session.hideAll")
+    for p in PARTS: p.hide()
+
+
+session = types.SimpleNamespace(showAll=_show_all, hideAll=_hide_all, clearHighlights=lambda: CALLS.append("clearHighlights"),
+                                DisplayRenderStyle=_Enum("Wireframe", "HiddenLines", "Filled", "FilledWithEdges", "Shaded",
+                                                         "ShadedWithEdges"),
+                                displayConnectionMarkers=lambda display: CALLS.append(("connection", display)) or display,
+                                displayLoadsAndBCMarkers=lambda display: CALLS.append(("loads_bc", display)) or display,
+                                displayMeshTopologyEdges=lambda displayEdges: CALLS.append(("mesh_edges", displayEdges)) or displayEdges)
+
+_SCALE = {"iso1": 120.0, "iso2": 121.0, "iso3": 122.0, "iso4": 123.0, "x": 100.0, "y": 150.0, "z": 200.0}
 
 
 class Cam:
-    focalPoint = Pt(1, 2, 3); position = Pt(); viewUp = Pt(0, 0, 1); distance = 5.0; parallelScale = 1.0
-    def getDirectionOfProjection(self): return Pt(-1, -1, -1)
-    def __getattr__(self, n): return lambda **kw: None
+    """A camera that remembers what it was told, like Apex's (one object per view)."""
+    def __init__(self):
+        self.pos, self.foc, self.up, self.scale, self.calls = Pt(10, 20, 30), Pt(1, 2, 3), Pt(0, 0, 1), 100.0, []
+    def _copy(self, p): return Pt(p.x, p.y, p.z)
+    def getPosition(self): return self._copy(self.pos)
+    def getFocalPoint(self): return self._copy(self.foc)
+    def getViewUp(self): return self._copy(self.up)
+    def getParallelScale(self): return self.scale
+    def getDistance(self): return 10000.0
+    def getDirectionOfProjection(self): return Pt(self.pos.x - self.foc.x, self.pos.y - self.foc.y, self.pos.z - self.foc.z)
+    def setPosition(self, *, position): self.pos = self._copy(position)
+    def setFocalPoint(self, *, focalPoint): self.foc = self._copy(focalPoint)
+    def setViewUp(self, *, viewUp): self.up = self._copy(viewUp)
+    def setParallelScale(self, *, parallelScale): self.scale = parallelScale
+    def _preset(self, name, reverse=False, viewUp=None, reset=True):
+        self.calls.append(("fit", name, reverse, viewUp))
+        self.scale, self.foc = _SCALE[name], Pt(0, 0, 0)
+        d = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}.get(name, (1, 1, 1))
+        self.pos = Pt(*[(-1 if reverse else 1) * c for c in d])
+    def viewFromX(self, reverse=False, viewUp=None, reset=True): self._preset("x", reverse, viewUp, reset)
+    def viewFromY(self, reverse=False, viewUp=None, reset=True): self._preset("y", reverse, viewUp, reset)
+    def viewFromZ(self, reverse=False, viewUp=None, reset=True): self._preset("z", reverse, viewUp, reset)
+    def viewIsometric_1(self, reverse=False, viewUp=None, reset=True): self._preset("iso1", reverse, viewUp, reset)
+    def viewIsometric_2(self, reverse=False, viewUp=None, reset=True): self._preset("iso2", reverse, viewUp, reset)
+    def viewIsometric_3(self, reverse=False, viewUp=None, reset=True): self._preset("iso3", reverse, viewUp, reset)
+    def viewIsometric_4(self, reverse=False, viewUp=None, reset=True): self._preset("iso4", reverse, viewUp, reset)
+    def rotate(self, *, azimuth_angle=0.0, elevation_angle=0.0): self.calls.append(("rotate", azimuth_angle, elevation_angle))
+    def roll(self, *, angle): self.calls.append(("roll", angle))
+    def zoom(self, *, factor): self.calls.append(("zoom", factor)); self.scale /= factor
+    def pan(self, *, horizontal_distance=0.0, vertical_distance=0.0): self.calls.append(("pan", horizontal_distance, vertical_distance))
+
+
+_CAM = Cam()
+CAP = {"empty": 0}  # the next N captures write a 0-byte file, like Apex with its UI hidden
 
 
 def _capture(path=None, imageNamePrefix="Image", imageCaptureRegion=None, imageFormat=None):
-    from PIL import Image as I
-    p = os.path.join(path, imageNamePrefix + ".png"); I.new("RGB", (2000, 1000), (40, 90, 160)).save(p); return p
+    """Panel (always), scale bar (always) and a 'model' block that exists only while a part is visible."""
+    from PIL import Image as I, ImageDraw as D
+    p = os.path.join(path, imageNamePrefix + "_1.png")
+    if CAP["empty"] > 0:
+        CAP["empty"] -= 1
+        open(p, "wb").close()
+        return p
+    im = I.new("RGB", (800, 400), (40, 90, 160))
+    d = D.Draw(im)
+    d.rectangle([5, 5, 150, 70], fill=(25, 25, 25))
+    d.rectangle([650, 360, 790, 392], fill=(200, 200, 200))
+    shown = [pt for pt in PARTS if pt.vis != "Hidden"]
+    if shown:
+        w = min(400, int(_CAM.scale * 2))
+        d.rectangle([300, 120, 300 + w, 300], fill=tuple(shown[0].color))
+    im.save(p)
+    return p
 
 
-display = types.SimpleNamespace(getCamera=lambda: Cam(), render=lambda: None, captureImage=_capture,
-                                CaptureRegionType=_Enum("Viewport"), ImageType=_Enum("png", "jpg"))
-construct = types.SimpleNamespace(Point3D=Pt)
+TEXTS = []
+
+
+def _display_text(text=None, textLocation=None, graphicsFontColor=None, graphicsFontSize=12, **kw):
+    t = types.SimpleNamespace(text=text)
+    TEXTS.append(t)
+    return t
+
+
+display = types.SimpleNamespace(getCamera=lambda: _CAM, render=lambda: None, captureImage=_capture,
+                                CaptureRegionType=_Enum("Viewport"), ImageType=_Enum("png", "jpg"),
+                                displayText=_display_text, clearText=lambda graphicsText: TEXTS.remove(graphicsText),
+                                clearAllGraphicsText=lambda: TEXTS.clear(),
+                                createCutView=lambda **kw: CALLS.append(("createCutView", kw)),
+                                displayCutViews=lambda display=True, **kw: CALLS.append(("displayCutViews", display)))
+construct = types.SimpleNamespace(Point3D=Pt, Vector3D=Pt)
 Coordinate = Pt
 
 
