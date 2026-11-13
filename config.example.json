@@ -11,5 +11,9 @@
   "max_response_kb": 256,
   "max_highlight_ids": 20000,
   "skills_dir": "",
-  "require_skill_lookup": true
+  "require_skill_lookup": true,
+  "script_preflight": true,
+  "script_effects": true,
+  "effects_budget_s": 5,
+  "effects_mesh_counts": true
 }

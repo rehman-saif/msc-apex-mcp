@@ -173,7 +173,9 @@ def on_selftest(sender=None, args=None):
             else:
                 log("  list_tree FAILED: %s" % r.get("error"))
             r = dispatch({"id": "t3", "method": "screenshot", "params": {"max_width": 800}})
-            log("  screenshot: %s" % (r["result"]["path"] if r.get("ok") else "FAILED " + str(r.get("error"))))
+            res = r.get("result") or {}
+            shot = res.get("sheet") or ((res.get("views") or [{}])[0].get("path"))
+            log("  screenshot: %s" % (shot if r.get("ok") else "FAILED " + str(r.get("error"))))
             log("  version %s" % _version())
             log("self-test done")
         except Exception:
