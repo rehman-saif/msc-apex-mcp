@@ -4,7 +4,8 @@ handle({"req_file", "resp_file", "root"}) reads one request, runs it through the
 shared handlers in Apex_MCP/apex_mcp/worker/apex_worker.py with the in-process
 `apex` module, and writes the response file atomically.
 
-If apex_worker.py, builders.py, scene.py, queries.py or serialize.py changed on disk since the last call,
+If apex_worker.py or one of the modules it imports (builders, scene, effects, introspect,
+queries, serialize) changed on disk since the last call,
 they are reloaded first, so edits take effect without restarting Apex
 (run_apex_python variables are reset when that happens).
 """
@@ -13,7 +14,7 @@ import json
 import os
 import sys
 
-_MODS = ("serialize", "queries", "builders", "scene", "apex_worker")
+_MODS = ("serialize", "queries", "builders", "scene", "effects", "introspect", "apex_worker")
 # Kept in sys.modules so it survives Apex re-executing this file for each call.
 _ST = sys.modules.setdefault("_mcp_bridge_worker_state", type(sys)("_mcp_bridge_worker_state"))
 if not hasattr(_ST, "mtimes"):

@@ -26,21 +26,20 @@ def _xyz(v):
 
 
 def entity_type(e):
-    for attr in ("entityType",):
-        try:
-            t = getattr(e, attr)
-            s = str(t)
-            return s.split(".")[-1]
-        except Exception:
-            pass
+    """'Part', 'Solid', 'NodeTie' ... In Apex entityType is an int (apex.EntityType has 421 members,
+    all ints), so the name comes from the entity's class; a dotted enum string is used as it is."""
+    try:
+        t = e.entityType
+        if isinstance(t, str) and t:
+            return t.split(".")[-1]
+    except Exception:
+        pass
     return type(e).__name__
 
 
 def ref(e):
-    """Short reference to an entity: name, path, type, id (and class when it differs from type)."""
+    """Short reference to an entity: type, name, path, id."""
     out = {"type": entity_type(e)}
-    if type(e).__name__ != out["type"]:
-        out["class"] = type(e).__name__
     for key, attr in (("name", "name"), ("path", "pathName"), ("id", "id")):
         try:
             val = getattr(e, attr)
@@ -108,14 +107,3 @@ def to_json(v, depth=1):
     except Exception:
         pass
     return str(v).split(".")[-1] if "." in str(v) and " " not in str(v) else str(v)
-
-
-def describe(e, props, depth=1):
-    """ref(e) plus the listed properties, each read defensively."""
-    out = ref(e)
-    for p in props:
-        try:
-            out[p] = to_json(getattr(e, p), depth)
-        except Exception as exc:
-            out[p] = "<error: %s>" % str(exc)[:120]
-    return out

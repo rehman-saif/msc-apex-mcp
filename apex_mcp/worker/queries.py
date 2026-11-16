@@ -64,7 +64,23 @@ def name_of(v):
     return s.split(".")[-1] if "." in s and " " not in s else s
 
 
-def enum_name(v):
+_ENUM_NAMES = {}  # enum class -> {int value: member name}
+
+
+def enum_name(v, enum_cls=None):
+    """Member name of an Apex enum value. Apex enums are plain classes with int attributes, so the
+    value itself is only a number: pass the enum class (apex.Visibility, apex.EntityType) to get
+    the name back. Without a class, or for a value it does not hold, the last dotted part of str(v)."""
+    if enum_cls is not None and isinstance(v, int) and not isinstance(v, bool):
+        names = _ENUM_NAMES.get(enum_cls)
+        if names is None:
+            names = _ENUM_NAMES[enum_cls] = {}
+            for n in dir(enum_cls):
+                val = getattr(enum_cls, n, None)
+                if not n.startswith("_") and n != "thisown" and isinstance(val, int) and not isinstance(val, bool):
+                    names.setdefault(val, n)
+        if v in names:
+            return names[v]
     return str(v).split(".")[-1]
 
 
@@ -162,6 +178,13 @@ def topology_name(v):
         return _TOPO.get(int(v), str(v))
     except Exception:
         return enum_name(v)
+
+
+def element_properties(apex, kind="3D"):
+    """The model's 2D or 3D element properties. Apex 2024.1 lists them only with the model as target:
+    getPropertiesElement3Ds(target=[]) returns nothing (measured live)."""
+    fn = getattr(apex.catalog, "getPropertiesElement%ss" % kind)
+    return fn(target=[{"path": apex.currentModel().pathName}]) or []
 
 
 # ------------------------------------------------------------------ meshes
@@ -579,3 +602,58 @@ def geometry_bodies(part):
         for x in coll:
             out.append(x)
     return out
+
+
+def geometry_check(parts, tolerance=0.5, faults=True, small_features=True, budget_s=20.0, max_items=MAX_ITEMS):
+    """CAD health check of the solids and surfaces of `parts` (a part, an assembly, the model, or a
+    list of parts). Nothing is repaired. Returns per body the edge-length / face-area ranges,
+    free-edge counts and volumes (solid_summary / surface_summary), Apex's findGeometryFaults counted
+    by type (Sliver, SmallEdge, SmallFace, Overhang, Gap, Crack, Spike) and the number of small
+    features (gaps, overhangs, edges below `tolerance`, script length units) found by
+    findFixSmallSurfaceAndCurveFeatures with autoFix=False. Apex 2024.1 gives counts only: the fault
+    locations are not readable from Python."""
+    import apex
+    if hasattr(parts, "getParts"):
+        parts = list(parts.getParts(recursive=True))
+    elif hasattr(parts, "getSolids"):
+        parts = [parts]
+    b = Budget(budget_s)
+    bodies = apex.EntityCollection()
+    report = {"parts": [], "tolerance": float(tolerance)}
+    for part in parts:
+        prec = {"part": safe(lambda: part.pathName), "solids": [], "surfaces": []}
+        for s in safe(lambda: part.getSolids()) or []:
+            bodies.append(entity=s)
+            if len(prec["solids"]) < max_items and not b.over():
+                prec["solids"].append(solid_summary(s, b))
+        for s in safe(lambda: part.getSurfaces()) or []:
+            bodies.append(entity=s)
+            if len(prec["surfaces"]) < max_items and not b.over():
+                prec["surfaces"].append(surface_summary(s, b))
+        prec["already_meshed"] = bool(clen(safe(lambda: part.getMeshes())))
+        report["parts"].append(prec)
+    if b.hit:
+        report["budget_exceeded"] = "per-body stats incomplete; check fewer parts"
+    report["bodies_checked"] = bodies.len()
+    if bodies.len() == 0:
+        return report
+    if faults:
+        try:
+            res = apex.geometry.findGeometryFaults(target=bodies)
+            by_type = {}
+            for t in safe(lambda: list(res.faultTypes), []) or []:
+                name = fault_type_name(t)
+                by_type[name] = by_type.get(name, 0) + 1
+            report["geometry_faults"] = {"count": int(res.numGeometryFaults), "by_type": by_type}
+        except Exception as exc:
+            report["geometry_faults_error"] = str(exc)[:300]
+    if small_features:
+        try:
+            res = apex.geometry.findFixSmallSurfaceAndCurveFeatures(
+                target=bodies, enableGapDetection=True, enableOverhangDetection=True,
+                enableSmallEdgeDetection=True, tolerance=float(tolerance), autoFix=False)
+            report["small_features"] = {"count": int(res.numFeaturesIdentified)}
+        except Exception as exc:
+            report["small_features_error"] = str(exc)[:300]
+    report["seconds"] = b.elapsed()
+    return report

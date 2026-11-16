@@ -1,8 +1,7 @@
-"""Viewport scenes: what is visible, how it is drawn, where the camera is - and pictures of it.
+"""Pictures of the viewport: what is visible, how it is drawn, where the camera is.
 
-Two tools are built on one scene applicator:
-  viewport(scene, view, ...)      applies a scene and leaves it applied; also saves/lists named views.
-  screenshot(scene, views, ...)   applies a scene, captures each view, restores the user's scene.
+One tool: screenshot(scene, views, ...) applies a scene, captures each view and restores the user's
+scene and camera (restore=False leaves them as set up, which is how the view is changed for the user).
 
 What was measured in Apex 2024.1 (and shaped this file)
 -------------------------------------------------------
@@ -23,8 +22,8 @@ What was measured in Apex 2024.1 (and shaped this file)
   panning is done here. Custom views are a preset plus zoom, or a saved camera, which is restored
   in the order position, focal point, view-up, scale (verified pixel-exact).
 * A tight fit runs into the floating panels, so screenshots zoom out to margin 0.85 by default.
-* No Apex API reads back the marker/edge display toggles, highlights or cut views, so a
-  screenshot cannot undo those; it reports them under "not_restored".
+* No Apex API reads back the marker/edge display toggles, so a screenshot cannot undo those; it
+  reports them under "not_restored".
 
 Everything is keyword-only, like the rest of the Apex API. No handler walks elements or nodes.
 """
@@ -90,16 +89,6 @@ def _set_vis(e, v):
         e.show()
     elif v == 0:
         e.hide()
-
-
-def _rgb(c, what):
-    try:
-        r, g, b = [int(x) for x in c]
-    except Exception:
-        raise ValueError("%s must be [r, g, b]" % what)
-    if not all(0 <= x <= 255 for x in (r, g, b)):
-        raise ValueError("%s values must be 0-255" % what)
-    return [r, g, b]
 
 
 def _parts(W):
@@ -262,20 +251,23 @@ def aim(W, cam, spec, margin=1.0):
 
 
 # ---------------------------------------------------------------- scene validation
+SCENE_KEYS = ("show_only", "show", "hide", "show_all", "color_by_part", "render_style", "transparency",
+              "mesh_edges", "loads_bc_markers", "connection_markers")
+TOGGLES = (("connection_markers", "displayConnectionMarkers", "display"),
+           ("loads_bc_markers", "displayLoadsAndBCMarkers", "display"),
+           ("mesh_edges", "displayMeshTopologyEdges", "displayEdges"))
+
+
 def validate(W, spec, views=()):
     """Check everything up front so a bad request changes nothing. Returns {pathName: entity}."""
     apex = W.ensure_apex()
-    if spec.get("show_only") and (spec.get("show_all") or spec.get("hide_all")):
-        raise ValueError("show_only cannot be combined with show_all / hide_all")
-    st = spec.get("style") or {}
+    unknown = sorted(set(spec) - set(SCENE_KEYS))
+    if unknown:
+        raise ValueError("unknown scene key(s) %s. A scene takes: %s" % (unknown, ", ".join(SCENE_KEYS)))
+    if spec.get("show_only") and spec.get("show_all"):
+        raise ValueError("show_only cannot be combined with show_all")
     paths = set(spec.get("show_only") or []) | set(spec.get("show") or []) | set(spec.get("hide") or [])
-    paths |= set((st.get("transparency") or {})) | set((st.get("color") or {})) | set(st.get("paths") or [])
-    for h in spec.get("highlight") or []:
-        paths |= set(h.get("paths") or [])
-        if h.get("part_path"):
-            paths.add(h["part_path"])
-        if not (h.get("paths") or (h.get("part_path") and h.get("ids"))):
-            raise ValueError("highlight needs paths, or part_path + ids")
+    paths |= set(spec.get("transparency") or {})
     ents, missing = {}, []
     for p in sorted(paths):
         try:
@@ -283,17 +275,12 @@ def validate(W, spec, views=()):
         except Exception:
             missing.append(p)
     if missing:
-        raise KeyError("not found: %s (use list_tree / find_entities for exact pathNames)" % missing)
-    if st.get("render_style"):
-        W.enum(apex.session.DisplayRenderStyle, st["render_style"], "render_style")
-    for k, c in (st.get("color") or {}).items():
-        _rgb(c, "color of %s" % k)
-    for k, t in (st.get("transparency") or {}).items():
+        raise KeyError("not found: %s (model_overview gives the exact pathNames)" % missing)
+    if spec.get("render_style"):
+        W.enum(apex.session.DisplayRenderStyle, spec["render_style"], "render_style")
+    for k, t in (spec.get("transparency") or {}).items():
         if not 0 <= int(t) <= 100:
             raise ValueError("transparency of %s must be 0-100" % k)
-    for h in spec.get("highlight") or []:
-        if h.get("color"):
-            _rgb(h["color"], "highlight color")
     if len(views) > MAX_VIEWS:
         raise ValueError("at most %d views per call" % MAX_VIEWS)
     return ents
@@ -308,9 +295,6 @@ class Scene:
         self.apex = W.ensure_apex()
         self.vis0 = None
         self.style0 = []     # (entity, original style dict)
-        self.labels = []     # GraphicsText objects we created
-        self.highlighted = False
-        self.cut = False
         self.globals = []    # display toggles that cannot be read back
         self.applied = []
         self.warnings = []
@@ -318,19 +302,15 @@ class Scene:
     # -- snapshot
     def snapshot(self):
         sp = self.spec
-        if sp.get("show_only") or sp.get("show") or sp.get("hide") or sp.get("show_all") or sp.get("hide_all"):
+        if sp.get("show_only") or sp.get("show") or sp.get("hide") or sp.get("show_all"):
             self.vis0 = read_vis(self.W)
             if self.vis0["truncated"]:
                 self.warnings.append("more than %d entities inside parts: restore covers parts and the first "
                                      "%d entities inside them" % (MAX_CHILDREN, MAX_CHILDREN))
-        st = sp.get("style") or {}
         targets = []
-        if st.get("render_style"):
-            targets += [self.ents[p] for p in st.get("paths") or []] or _parts(self.W)
-        targets += [self.ents[p] for p in (st.get("transparency") or {})]
-        targets += [self.ents[p] for p in (st.get("color") or {})]
-        if st.get("color_by_part"):
+        if sp.get("render_style") or sp.get("color_by_part"):
             targets += _parts(self.W)
+        targets += [self.ents[p] for p in (sp.get("transparency") or {})]
         seen = set()
         for e in targets:
             if id(e) in seen:
@@ -353,12 +333,10 @@ class Scene:
     # -- apply
     def apply(self):
         apex, W, sp = self.apex, self.W, self.spec
-        parts = None
-        if sp.get("hide_all") or sp.get("show_only"):
-            parts = _parts(W)
-            for p in parts:
+        if sp.get("show_only"):
+            for p in _parts(W):
                 p.hide()
-            self.applied.append("hide_all" if sp.get("hide_all") else "show_only")
+            self.applied.append("show_only")
         if sp.get("show_all"):
             for p in _parts(W):
                 p.show()
@@ -369,10 +347,7 @@ class Scene:
             self.ents[path].hide()
         if sp.get("show") or sp.get("hide"):
             self.applied.append("show/hide")
-        self._apply_style(sp.get("style") or {})
-        self._apply_highlight()
-        self._apply_labels()
-        self._apply_cut()
+        self._apply_style()
         apex.display.render()
         return self.applied
 
@@ -382,87 +357,26 @@ class Scene:
         except Exception as exc:
             self.warnings.append("%s on %s failed: %s" % (what, Q_path(e), str(exc)[:120]))
 
-    def _apply_style(self, st):
-        apex, W = self.apex, self.W
-        if st.get("render_style"):
-            member = W.enum(apex.session.DisplayRenderStyle, st["render_style"], "render_style")
-            for e in ([self.ents[p] for p in st.get("paths") or []] or _parts(W)):
+    def _apply_style(self):
+        apex, W, sp = self.apex, self.W, self.spec
+        if sp.get("render_style"):
+            member = W.enum(apex.session.DisplayRenderStyle, sp["render_style"], "render_style")
+            for e in _parts(W):
                 self._update(e, "render_style", renderStyle=member)
             self.applied.append("render_style")
-        colors = {}
-        if st.get("color_by_part"):
-            vis = [p for p in _parts(W) if _vis(p) != 0]
-            for i, p in enumerate(vis):
-                colors[id(p)] = (p, PALETTE[i % len(PALETTE)])
-        for path, c in (st.get("color") or {}).items():
-            colors[id(self.ents[path])] = (self.ents[path], _rgb(c, "color"))
-        for e, c in colors.values():
-            self._update(e, "color", color=c)
-        if colors:
+        if sp.get("color_by_part"):
+            for i, p in enumerate(p for p in _parts(W) if _vis(p) != 0):
+                self._update(p, "color", color=PALETTE[i % len(PALETTE)])
             self.applied.append("color")
-        for path, t in (st.get("transparency") or {}).items():
+        for path, t in (sp.get("transparency") or {}).items():
             self._update(self.ents[path], "transparency", enableTransparency=W.apex_bool(int(t) > 0),
                          transparencyLevel=int(t))
             self.applied.append("transparency")
-        for key, fn, arg in (("connection_markers", "displayConnectionMarkers", "display"),
-                             ("loads_bc_markers", "displayLoadsAndBCMarkers", "display"),
-                             ("mesh_edges", "displayMeshTopologyEdges", "displayEdges")):
-            if st.get(key) is not None:
-                getattr(apex.session, fn)(**{arg: bool(st[key])})
+        for key, fn, arg in TOGGLES:
+            if sp.get(key) is not None:
+                getattr(apex.session, fn)(**{arg: bool(sp[key])})
                 self.globals.append(key)
                 self.applied.append(key)
-
-    def _apply_highlight(self):
-        apex, W, sp = self.apex, self.W, self.spec
-        if sp.get("clear_highlights"):
-            apex.session.clearHighlights()
-            self.applied.append("clear_highlights")
-        for h in sp.get("highlight") or []:
-            rgb = _rgb(h.get("color") or [255, 0, 255], "highlight color")
-            color = apex.ColorRGB(*rgb)
-            if h.get("ids"):
-                ids = [int(i) for i in h["ids"]]
-                cap = int(W.cfg("max_highlight_ids"))
-                if len(ids) > cap:
-                    raise ValueError("%d ids requested; max_highlight_ids is %d" % (len(ids), cap))
-                coll = apex.get(target=[{"type": h.get("kind", "Element"), "path": h["part_path"],
-                                         "ids": _Q(W).rle(ids)}])
-            else:
-                coll = W.entities_by_path(h["paths"])
-            for e in coll:
-                e.highlight(colorRGB=color)
-            self.highlighted = True
-            self.applied.append("highlight")
-
-    def _apply_labels(self):
-        apex, sp = self.apex, self.spec
-        if sp.get("clear_labels"):
-            apex.display.clearAllGraphicsText()
-            self.applied.append("clear_labels")
-        for lb in sp.get("labels") or []:
-            x, y, z = [float(c) for c in lb["at"]]
-            rgb = _rgb(lb.get("color") or [0, 0, 0], "label color")
-            self.labels.append(apex.display.displayText(
-                text=lb["text"], textLocation=apex.Coordinate(x, y, z),
-                graphicsFontColor=apex.ColorRGB(*rgb), graphicsFontSize=int(lb.get("size", 14))))
-            self.applied.append("label")
-
-    def _apply_cut(self):
-        apex, cut = self.apex, self.spec.get("cut")
-        if not cut:
-            return
-        if cut.get("off"):
-            apex.display.displayCutViews(display=False)
-            self.applied.append("cut off")
-            return
-        kw = {"bSlideMode": bool(cut.get("slice", False))}
-        if cut.get("location") is not None:
-            x, y, z = [float(c) for c in cut["location"]]
-            kw["location"] = apex.Coordinate(x, y, z)
-        apex.display.createCutView(**kw)
-        apex.display.displayCutViews(display=True)
-        self.cut = True
-        self.applied.append("cut")
 
     # -- restore
     def restore(self):
@@ -488,31 +402,14 @@ class Scene:
                     e.update(**kw)
                 except Exception as exc:
                     problems.append("style of %s: %s" % (Q_path(e), str(exc)[:100]))
-            if s.get("render") not in RENDER_NAMES and (self.spec.get("style") or {}).get("render_style"):
+            if s.get("render") not in RENDER_NAMES and self.spec.get("render_style"):
                 try:
                     e.unsetRender()
                 except Exception:
                     pass
-        for t in self.labels:
-            try:
-                apex.display.clearText(graphicsText=t)
-            except Exception as exc:
-                problems.append("label: %s" % str(exc)[:80])
-        if self.highlighted:
-            try:
-                apex.session.clearHighlights()
-            except Exception:
-                pass
-        notes = []
         if self.globals:
-            notes.append("display toggles %s (Apex cannot read them back)" % self.globals)
-        if self.cut:
-            notes.append("cut view (hidden again with cut={'off': true})")
-            try:
-                apex.display.displayCutViews(display=False)
-            except Exception:
-                pass
-        return problems + notes
+            problems.append("display toggles %s (Apex cannot read them back)" % self.globals)
+        return problems
 
 
 def Q_path(e):
@@ -714,40 +611,9 @@ def make_sheet(tiles, max_width):
 
 
 # ---------------------------------------------------------------- tools
-def viewport(W, p):
-    """Apply a scene (persistently) and/or move the camera; save, list or delete named views."""
-    spec = p.get("scene") or {}
-    view = p.get("view")
-    ents = validate(W, spec, [view] if view else [])
-    vspec = resolve_view(W, view) if view else None
-    apex = W.ensure_apex()
-    cam = apex.display.getCamera()
-    sess = Scene(W, spec, ents)
-    sess.apply()
-    out = {"applied": sess.applied, "warnings": sess.warnings}
-    if vspec:
-        out["camera"] = aim(W, cam, vspec)
-        apex.display.render()
-    if p.get("save_view"):
-        out["saved_view"] = p["save_view"]
-        out["camera"] = save_view(W, p["save_view"], cam)
-    if p.get("delete_view"):
-        name = p["delete_view"]
-        path = _view_file(W, name) if NAME_OK.match(name) else None
-        if not path or not os.path.isfile(path):
-            raise KeyError("no saved view '%s'. Saved: %s" % (name, sorted(list_saved(W))))
-        os.remove(path)
-        out["deleted_view"] = name
-    if p.get("list_views") or p.get("save_view") or p.get("delete_view"):
-        out["saved_views"] = list_saved(W)
-    if not out["applied"] and not vspec and not p.get("list_views") and not p.get("save_view") \
-            and not p.get("delete_view"):
-        out["camera"] = camera_state(cam)  # nothing to do: report where the camera is
-    return out
-
-
 def screenshot(W, p):
-    """Apply a scene, capture each view, put the user's scene back."""
+    """Apply a scene, capture each view, put the user's scene and camera back (unless restore is
+    false). save_view first stores the camera as the user has it, under that name."""
     apex = W.ensure_apex()
     spec = p.get("scene") or {}
     views = list(p.get("views") or [None])
@@ -763,10 +629,12 @@ def screenshot(W, p):
     if not 0.3 <= margin <= 1.0:
         raise ValueError("margin must be between 0.3 and 1.0 (1.0 = Apex's tight fit)")
     ents = validate(W, spec, views)
+    cam = apex.display.getCamera()
+    if p.get("save_view"):  # before the views are resolved: this call may use the name it saves
+        save_view(W, p["save_view"], cam)
     vspecs = [resolve_view(W, v) for v in views]
     window = ensure_visible(W)
     Image = _pil()[0]
-    cam = apex.display.getCamera()
     cam0 = camera_state(cam)
     sess = Scene(W, spec, ents)
     warnings = sess.warnings
@@ -810,6 +678,8 @@ def screenshot(W, p):
                 not_restored = list(not_restored) + ["restore failed: %s" % exc]
     out = {"views": [{k: v for k, v in s.items() if k != "_img"} for s in shots], "applied": sess.applied,
            "restored": restore, "not_restored": not_restored, "window": window, "warnings": warnings}
+    if p.get("save_view"):
+        out["saved_views"] = sorted(list_saved(W))
     if layout == "sheet" and len(shots) > 1 and Image is not None and all(s["_img"] is not None for s in shots):
         sheet = make_sheet([(s["name"], s["_img"]) for s in shots], max_w)
         sheet_path = os.path.join(W.out_dir("screenshots"), "sheet_%s.png" % W.stamp())
@@ -818,4 +688,4 @@ def screenshot(W, p):
     return out
 
 
-TOOLS = {"viewport": viewport, "screenshot": screenshot}
+TOOLS = {"screenshot": screenshot}

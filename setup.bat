@@ -1,10 +1,9 @@
 @echo off
-rem Sets up the Apex MCP server. Safe to re-run: it also updates the skills.
+rem Sets up the Apex MCP server. Safe to re-run.
 rem   1. .venv with the MCP SDK (your Python 3.10+; Apex's own Python is not touched)
 rem   2. config.json with a fresh bridge_token (kept if it already exists)
-rem   3. the nastran-fea-skills repo in vendor\ (the server checks Apex Python against it)
-rem   4. MCP client config snippets with this folder's paths
-rem   5. optionally: Claude Code plugin + MCP server registration
+rem   3. MCP client config snippets with this folder's paths
+rem   4. optionally: the nastran-fea-skills plugin + MCP server registration (Claude Code, Codex)
 rem Run "setup.bat /y" to configure Claude Code without asking.
 setlocal
 cd /d "%~dp0"

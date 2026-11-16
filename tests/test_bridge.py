@@ -218,5 +218,5 @@ if __name__ == "__main__":
         except Exception as exc:  # report every failure, not only the first
             failed += 1
             print("FAIL", n, "-", type(exc).__name__, exc)
-    print("\nRESULT:", "PASS" if not failed else "FAIL (%d)" % failed)
+    print("\nRESULT:", "PASS" if not failed else "FAIL (%d)" % failed, flush=True)
     os._exit(1 if failed else 0)  # a timed-out fake call may still be sleeping on its thread

@@ -17,7 +17,6 @@ Apex down. So:
 """
 import contextlib
 import datetime
-import hashlib
 import io
 import json
 import linecache
@@ -33,34 +32,18 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import builders as B  # noqa: E402
+import effects as FX  # noqa: E402
+import introspect as IN  # noqa: E402
 import queries as Q  # noqa: E402
 import scene as SC  # noqa: E402
 import serialize as S  # noqa: E402
 
-# Files whose copies must match between the MCP server and the bridge (apex_status compares them).
-DEPLOYED_FILES = ["apex_mcp/worker/apex_worker.py", "apex_mcp/worker/queries.py",
-                  "apex_mcp/worker/serialize.py", "apex_mcp/worker/builders.py", "apex_mcp/worker/scene.py",
-                  "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_worker.py",
-                  "apex_palette/MCP/Bridge/MCP Bridge/src/mcp_bridge_ui.py"]
-
-
-def file_hashes(root, rels=DEPLOYED_FILES):
-    """{relative path: first 12 hex chars of sha256, or None if missing}."""
-    out = {}
-    for rel in rels:
-        try:
-            with open(os.path.join(root, *rel.split("/")), "rb") as fh:
-                out[rel] = hashlib.sha256(fh.read()).hexdigest()[:12]
-        except OSError:
-            out[rel] = None
-    return out
-
 CFG = {}
 MODE = {"inprocess": False, "log_file": None}
-STATE = {"attached": False, "pid": None, "ns": None, "apex": None}
+STATE = {"ns": None, "apex": None}
 
 DEFAULTS = {"query_time_budget_s": 20.0, "max_items": 200, "max_response_kb": 256,
-            "max_highlight_ids": 20000}
+            "effects_budget_s": 5.0, "effects_mesh_counts": True}
 
 
 # ------------------------------------------------------------------ util
@@ -85,7 +68,7 @@ def set_inprocess(config=None):
     if config:
         CFG.clear()
         CFG.update(config)
-        STATE["attached"] = False  # ensure_apex applies script_unit_system again
+        STATE["apex"] = None  # ensure_apex applies script_unit_system again
     MODE["inprocess"] = True
     MODE["log_file"] = os.path.join(out_dir("bridge"), "bridge_worker.log")
 
@@ -99,6 +82,11 @@ def out_dir(kind):
 
 def stamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+
+class Refusal(ValueError):
+    """An expected refusal: the message says it all, so no traceback goes back with it."""
+    quiet = True
 
 
 def enum(enum_cls, name, what):
@@ -125,10 +113,10 @@ def limit_of(p):
 
 
 def ensure_apex():
-    if STATE["attached"]:
+    if STATE["apex"] is not None:
         return STATE["apex"]
     import apex
-    STATE.update(attached=True, pid=str(os.getpid()), apex=apex)
+    STATE["apex"] = apex
     units = CFG.get("script_unit_system")
     if units:
         apex.setScriptUnitSystem(unitSystemName=units)
@@ -149,7 +137,7 @@ def entities_by_path(paths):
         except Exception:
             missing.append(p)
     if missing:
-        raise KeyError("not found: %s (use list_tree / find_entities for exact pathNames)" % missing)
+        raise KeyError("not found: %s (model_overview gives the exact pathNames)" % missing)
     return coll
 
 
@@ -173,31 +161,29 @@ def parts_from(paths):
 
 # ----------------------------------------------------------- model tools
 def m_status(p):
-    out = {"worker_python": sys.version.split()[0], "attached": STATE["attached"],
-           "limits": {k: cfg(k) for k in DEFAULTS},
-           "config": {k: v for k, v in CFG.items() if "token" not in k},
-           "deployment": {"root": ROOT, "config_path": os.path.join(ROOT, "config.json"),
-                          "hashes": file_hashes(ROOT)}}
-    if p.get("connect", True):
-        apex = ensure_apex()
-        out["attached"], out["pid"] = True, STATE["pid"]
-        out["application"] = S.to_json(apex.getApplicationInfo())
-        model = apex.currentModel()
-        out["model"] = S.ref(model) if model is not None else None
-        for k, fn in (("script_units", "getScriptUnitSystemLabel"),
-                      ("application_units", "getApplicationUnitSystemLabel"),
-                      ("project_folder", "getCurrentProjectFolderPath")):
-            try:
-                out[k] = getattr(apex, fn)()
-            except Exception as exc:
-                out[k] = "<error: %s>" % exc
+    """What the server needs for apex_status. `root` lets it see that Apex runs this copy."""
+    apex = ensure_apex()
+    model = apex.currentModel()
+    out = {"root": ROOT, "application": S.to_json(apex.getApplicationInfo()),
+           "model": Q.safe(lambda: model.pathName) if model is not None else None}
+    for k, fn in (("script_units", "getScriptUnitSystemLabel"),
+                  ("application_units", "getApplicationUnitSystemLabel"),
+                  ("project_folder", "getCurrentProjectFolderPath")):
+        try:
+            out[k] = getattr(apex, fn)()
+        except Exception as exc:
+            out[k] = "<error: %s>" % exc
     return out
 
 
-def _part_counts(part):
-    rec = S.ref(part)
-    for k, getter in (("solids", "getSolids"), ("surfaces", "getSurfaces"), ("meshes", "getMeshes")):
-        rec[k] = Q.clen(Q.safe(lambda g=getter: getattr(part, g)()))
+TREE_COLS = ["path", "solids", "surfaces", "meshes", "elements", "nodes", "visible"]
+
+
+def _part_row(part, apex):
+    """One row of the overview's parts, in the order of TREE_COLS."""
+    row = [Q.safe(lambda: part.pathName)]
+    for getter in ("getSolids", "getSurfaces", "getMeshes"):
+        row.append(Q.clen(Q.safe(lambda g=getter: getattr(part, g)())))
     # element/node totals from the bulk ID arrays of each mesh (no element objects)
     ne = nn = 0
     for m in Q.safe(lambda: part.getMeshes()) or []:
@@ -205,38 +191,33 @@ def _part_counts(part):
         ne += sum(c.values())
         ids = Q.safe(lambda: m.getNodeIDs())
         nn += len(ids) if ids is not None else 0
-    rec["elements"], rec["nodes"] = ne, nn
-    rec["visibility"] = Q.enum_name(Q.safe(lambda: part.getVisibility(), "?"))
-    return rec
+    vis = Q.enum_name(Q.safe(lambda: part.getVisibility()), Q.safe(lambda: apex.Visibility))
+    return row + [ne, nn, vis != "Hidden"]
 
 
-def m_list_tree(p):
-    apex = ensure_apex()
-    counts = bool(p.get("counts", True))
-    max_depth = int(p.get("max_depth", 10))
-    b = Q.Budget(cfg("query_time_budget_s"))
-    cap = limit_of(p)
-    seen = {"n": 0}
-
-    def walk(asm, depth):
-        node = S.ref(asm)
-        parts = []
-        for pt in Q.safe(lambda: asm.getParts(recursive=False)) or []:
-            seen["n"] += 1
-            if seen["n"] > cap or b.over():
-                node["truncated"] = True
-                break
-            parts.append(_part_counts(pt) if counts else S.ref(pt))
-        node["parts"] = parts
-        if depth < max_depth and not b.hit:
-            node["assemblies"] = [walk(a, depth + 1)
-                                  for a in (Q.safe(lambda: asm.getAssemblies(recursive=False)) or [])]
-        return node
-
-    tree = walk(apex.currentModel(), 0)
-    if b.hit:
-        tree["budget_exceeded"] = True
-    return tree
+def _tree(apex, model, counts, cap, b):
+    """One row per part. The assembly tree is in the paths; assemblies that hold no part anywhere
+    below them are listed separately, since no part path shows them."""
+    all_parts = list(Q.safe(lambda: model.getParts(recursive=True)) or [])
+    rows = []
+    for pt in all_parts:
+        if len(rows) >= cap or b.over():
+            break
+        rows.append(_part_row(pt, apex) if counts else Q.safe(lambda: pt.pathName))
+    out = {"cols": TREE_COLS} if counts else {}
+    out["parts"] = rows
+    if len(rows) < len(all_parts):
+        out["parts_truncated"] = "%d of %d parts listed%s" % (len(rows), len(all_parts),
+                                                               "; time budget reached" if b.hit else "; raise limit")
+    part_paths = [Q.safe(lambda: pt.pathName) or "" for pt in all_parts]
+    empty = []
+    for a in Q.safe(lambda: model.getAssemblies(recursive=True)) or []:
+        path = Q.safe(lambda: a.pathName)
+        if path and not any(pp.startswith(path + "/") for pp in part_paths):
+            empty.append(path)
+    if empty:
+        out["empty_assemblies"] = empty[:cap]
+    return out
 
 
 def m_part_summary(p):
@@ -256,68 +237,6 @@ def m_part_summary(p):
         res["budget_exceeded"] = "summarised %d of %d parts; ask for fewer with paths" % (len(out), len(parts))
         res["parts_skipped"] = len(parts) - len(out)
     return res
-
-
-def m_geometry_check(p):
-    """Read-only CAD health check: Apex geometry faults, small features, per-body stats."""
-    apex = ensure_apex()
-    b = Q.Budget(cfg("query_time_budget_s"))
-    cap = limit_of(p)
-    tol = float(p.get("small_feature_tolerance", 0.5))
-    bodies = apex.EntityCollection()
-    report = {"parts": [], "tolerance": tol}
-    for part in parts_from(p.get("paths")):
-        prec = {"part": S.ref(part), "solids": [], "surfaces": []}
-        for s in Q.safe(lambda: part.getSolids()) or []:
-            bodies.append(entity=s)
-            if len(prec["solids"]) < cap and not b.over():
-                prec["solids"].append(Q.solid_summary(s, b))
-        for s in Q.safe(lambda: part.getSurfaces()) or []:
-            bodies.append(entity=s)
-            if len(prec["surfaces"]) < cap and not b.over():
-                prec["surfaces"].append(Q.surface_summary(s, b))
-        prec["already_meshed"] = bool(Q.clen(Q.safe(lambda: part.getMeshes())))
-        report["parts"].append(prec)
-    if b.hit:
-        report["budget_exceeded"] = "per-body stats incomplete; check fewer parts"
-    report["bodies_checked"] = bodies.len()
-    if bodies.len() == 0:
-        return report
-    if p.get("faults", True):
-        try:
-            res = apex.geometry.findGeometryFaults(target=bodies)
-            by_type = {}
-            for t in Q.safe(lambda: list(res.faultTypes), []) or []:
-                name = Q.fault_type_name(t)
-                by_type[name] = by_type.get(name, 0) + 1
-            # Apex 2024.1 returns the fault locations as an unwrapped SWIG vector that Python
-            # cannot iterate, so only counts are reported; per-body stats above show where.
-            report["geometry_faults"] = {"count": int(res.numGeometryFaults), "by_type": by_type}
-        except Exception as exc:
-            report["geometry_faults_error"] = str(exc)[:300]
-    if p.get("small_features", True):
-        try:
-            res = apex.geometry.findFixSmallSurfaceAndCurveFeatures(
-                target=bodies, enableGapDetection=True, enableOverhangDetection=True,
-                enableSmallEdgeDetection=True, tolerance=tol, autoFix=False)
-            report["small_features"] = {"count": int(res.numFeaturesIdentified),
-                                        "note": "details not readable from Python in Apex 2024.1"}
-        except Exception as exc:
-            report["small_features_error"] = str(exc)[:300]
-    report["seconds"] = b.elapsed()
-    return report
-
-
-def m_get_entity(p):
-    """Reference, bounding box and the listed properties of one entity. No element walking."""
-    ensure_apex()
-    e = one_entity(p["path"])
-    props = p.get("properties") or []
-    rec = S.describe(e, props, depth=0) if props else S.ref(e)
-    rec["bounding_box"] = Q.bbox(e)
-    if hasattr(e, "getMeshes"):
-        rec["hint"] = "use part_summary for mesh / property / material detail"
-    return rec
 
 
 def m_list_faces(p):
@@ -349,11 +268,6 @@ def m_list_faces(p):
 _CONN_GETTERS = ["getFasteners", "getBolt3Ds", "getRigidLinks", "getBushings", "getConnectors",
                  "getConnectorDiscretes", "getNodeTies", "getDiscreteTies",
                  "getMeshDependentTies", "getInteractions", "getPointMasses"]
-_CONN_PROPS = ["connectorType", "diameter", "stiffness", "preload", "dependentDof",
-               "distributionType", "end1AttachmentRegion", "end2AttachmentRegion",
-               "attachmentRegions", "contactBody1", "contactBody2", "bodies"]
-
-
 def _call_getter(fn, model):
     for target in ([{"path": model.pathName}], [{"path": model.name}], []):
         try:
@@ -375,123 +289,101 @@ def _iter_connections(model, budget):
             yield name[3:], e
 
 
-def m_find_entities(p):
-    apex = ensure_apex()
-    needle = (p.get("name_contains") or "").lower()
-    cap = limit_of(p)
-    b = Q.Budget(cfg("query_time_budget_s"))
-    out = []
-    model = apex.currentModel()
-    for kind, getter in (("assembly", lambda: model.getAssemblies(recursive=True)),
-                         ("part", lambda: model.getParts(recursive=True))):
-        for e in Q.safe(getter) or []:
-            if len(out) >= cap or b.over():
-                break
-            if needle in (Q.safe(lambda: e.name, "") or "").lower():
-                rec = S.ref(e)
-                rec["kind"] = kind
-                out.append(rec)
-    if p.get("include_connections", True) and len(out) < cap and not b.hit:
-        for kind, c in _iter_connections(model, b):
-            if len(out) >= cap:
-                break
-            if needle in (Q.safe(lambda: c.name, "") or "").lower():
-                rec = S.ref(c)
-                rec["kind"] = kind
-                out.append(rec)
-    return {"matches": out, "truncated": len(out) >= cap or b.hit}
+PER_TYPE = 10  # connections listed per type; the counts are always complete
 
 
-def m_list_connections(p):
-    """Counts per connection type, then names (details=True adds a few key properties;
-    collections inside them are reported as counts only)."""
-    apex = ensure_apex()
-    model = apex.currentModel()
-    cap = limit_of(p)
-    details = bool(p.get("details", False))
-    props = p.get("properties") or _CONN_PROPS
-    per_type = max(1, int(p.get("per_type") or 10))
-    b = Q.Budget(cfg("query_time_budget_s"))
+def _connections(apex, model, cap, b):
     counts, items = {}, []
     for kind, e in _iter_connections(model, b):
         counts[kind] = counts.get(kind, 0) + 1
-        if len(items) < cap and counts[kind] <= per_type:
-            rec = S.describe(e, [x for x in props if hasattr(e, x)], depth=0) if details else S.ref(e)
-            rec["kind"] = kind
+        if len(items) < cap and counts[kind] <= PER_TYPE:
+            rec = S.ref(e)
+            rec["type"] = kind
             items.append(rec)
-    total = sum(counts.values())
-    return {"counts_by_type": counts, "total": total, "items": items,
-            "truncated": total > len(items), "budget_exceeded": b.hit}
+    out = {"count": sum(counts.values()), "by_type": counts, "items": items}
+    if out["count"] > len(items):
+        out["note"] = "first %d of each type listed" % PER_TYPE
+    return out
 
 
-def m_list_loads_constraints(p):
-    apex = ensure_apex()
-    cap = limit_of(p)
-    res = {}
-    for key, fn in (("loads", apex.environment.getLoads), ("constraints", apex.environment.getConstraints)):
-        try:
-            coll = fn() or []
-            res[key + "_count"] = Q.clen(coll)
-            res[key] = [S.ref(x) for i, x in enumerate(coll) if i < cap]
-        except Exception as exc:
-            res[key + "_error"] = str(exc)[:300]
-    return res
+def _listed(coll, cap):
+    coll = coll or []
+    return {"count": Q.clen(coll), "items": [S.ref(x) for i, x in enumerate(coll) if i < cap]}
 
 
-def m_list_catalog(p):
+def _catalog(apex, model, cap, b):
     """Names of materials and element properties in the catalog (what can be assigned)."""
-    apex = ensure_apex()
-    cap = limit_of(p)
     out = {}
     for key, fn in (("materials", lambda: apex.catalog.getMaterials(target=[])),
                     ("assigned_materials", lambda: apex.catalog.getAssignedMaterials()),
-                    ("properties_2d", lambda: apex.catalog.getPropertiesElement2Ds(target=[])),
-                    ("properties_3d", lambda: apex.catalog.getPropertiesElement3Ds(target=[])),
-                    ("layered_panels", lambda: apex.attribute.getLayeredPanels(
-                        target=[{"path": apex.currentModel().pathName}]))):
+                    ("properties_2d", lambda: Q.element_properties(apex, "2D")),
+                    ("properties_3d", lambda: Q.element_properties(apex, "3D")),
+                    ("layered_panels", lambda: apex.attribute.getLayeredPanels(target=[{"path": model.pathName}]))):
         try:
             coll = fn() or []
-            out[key] = {"count": Q.clen(coll),
-                        "names": [Q.name_of(x) for i, x in enumerate(coll) if i < cap]}
+            out[key] = {"count": Q.clen(coll), "names": [Q.name_of(x) for i, x in enumerate(coll) if i < cap]}
         except Exception as exc:
             out[key] = {"error": str(exc)[:200]}
     return out
 
 
-def m_list_scenarios(p):
-    apex = ensure_apex()
+def _scenarios(apex, model, cap, b):
     study = Q.safe(apex.getPrimaryStudy)
+    out = []
     if study is None:
-        return {"study": None, "scenarios": []}
-    out = {"study": S.ref(study), "scenarios": []}
+        return out
+    studies = Q.safe(lambda: apex.studies)
+    enums = {"executionStatus": Q.safe(lambda: studies.ExecutionStatus),
+             "solutionType": Q.safe(lambda: studies.NastranSolutionType)}
+    # an empty study returns None, not an empty collection
     for kind, getter in (("Scenario", lambda: study.getScenarios(recursive=True)),
                          ("ScenarioNastran", lambda: study.getScenariosNastran())):
-        try:
-            for scn in getter() or []:  # an empty study returns None, not an empty collection
-                rec = S.ref(scn)
-                rec["kind"] = kind
-                for attr in ("executionStatus", "solutionType"):
-                    v = Q.safe(lambda a=attr: getattr(scn, a))
-                    if v is not None:
-                        rec[attr] = Q.enum_name(v)
-                subs = Q.safe(lambda: [{"name": sc.name, "subcaseID": sc.subcaseID} for sc in scn.subcases])
-                if subs:
-                    rec["subcases"] = subs[:50]
-                out["scenarios"].append(rec)
-        except Exception as exc:
-            out[kind + "_error"] = str(exc)[:300]
+        for scn in getter() or []:
+            rec = {"type": kind, "name": Q.name_of(scn), "path": Q.safe(lambda: scn.pathName)}
+            for attr in ("executionStatus", "solutionType"):
+                v = Q.safe(lambda a=attr: getattr(scn, a))
+                if v is not None:  # ints in Apex: named through the enum class (Nastran scenarios)
+                    rec[attr] = Q.enum_name(v, enums[attr] if kind == "ScenarioNastran" or attr == "executionStatus"
+                                            else None)
+            subs = Q.safe(lambda: [{"name": sc.name, "id": sc.subcaseID} for sc in scn.subcases])
+            if subs:
+                rec["subcases"] = subs[:50]
+            out.append(rec)
     return out
 
 
-def m_import_fe_model(p):
+OVERVIEW = {  # section -> (apex, model, cap, budget) -> content; "parts" is handled apart (it has `counts`)
+    "connections": _connections,
+    "loads": lambda apex, model, cap, b: _listed(apex.environment.getLoads(), cap),
+    "constraints": lambda apex, model, cap, b: _listed(apex.environment.getConstraints(), cap),
+    "catalog": _catalog,
+    "scenarios": _scenarios,
+}
+SECTIONS = ("parts",) + tuple(OVERVIEW)
+
+
+def m_model_overview(p):
+    """What the model holds, by section. A section that fails is reported, the others still come back."""
     apex = ensure_apex()
+    sections = list(p.get("sections") or SECTIONS)
+    unknown = [s for s in sections if s not in SECTIONS]
+    if unknown:
+        raise Refusal("unknown section(s) %s. Sections: %s" % (unknown, ", ".join(SECTIONS)))
+    b = Q.Budget(cfg("query_time_budget_s"))
+    cap = limit_of(p)
     model = apex.currentModel()
-    kw = dict(feModelFileName=p["model_file"], modelType=apex.mesh.FEModelFormat.NastranBulk,
-              unitSystemName=p["unit_system"])
-    if p.get("organize_by"):
-        kw["organizeBy"] = enum(apex.mesh.FEModelImportOrganizationOptions, p["organize_by"], "organize_by")
-    ent = model.importFEModel(**kw)
-    return {"created": S.ref(ent)}
+    out = {"model": Q.safe(lambda: model.pathName)}
+    for name in sections:
+        try:
+            if name == "parts":
+                out.update(_tree(apex, model, bool(p.get("counts", True)), cap, b))
+            else:
+                out[name] = OVERVIEW[name](apex, model, cap, b)
+        except Exception as exc:
+            out[name + "_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+    if b.hit:
+        out["budget_exceeded"] = "query_time_budget_s reached: ask for fewer sections"
+    return out
 
 
 def nastran_scenarios(study):
@@ -528,9 +420,16 @@ def m_export_bdf(p):
     except RuntimeError as exc:
         if "units system" not in str(exc):
             raise
-        raise ValueError("Apex cannot export a deck in '%s'%s. Pass unit_system with a consistent system, "
+        raise Refusal("Apex cannot export a deck in '%s'%s. Pass unit_system with a consistent system, "
                          "e.g. mm-t-s-N-K or m-kg-s-N-K, in the units the model was built for."
                          % (units, "" if chosen else ", its current script units")) from exc
+    if not os.path.isfile(path):  # Apex 2024.1 returned without error and wrote nothing (unmeshed model)
+        elements = sum(sum(Q.topology_counts(m)[0].values())
+                       for p in Q.safe(lambda: apex.currentModel().getParts(recursive=True)) or []
+                       for m in Q.safe(lambda: p.getMeshes()) or [])
+        raise Refusal("Apex reported no error but wrote no deck to %s.%s" % (
+            path, " The model has no mesh (0 elements), so there may be nothing to export." if elements == 0
+            else " Check the scenario %s in Apex." % (repr(Q.name_of(scn)) if scn is not None else "")))
     out = {"path": path, "scenario": Q.name_of(scn) if scn else None, "unit_system": units,
            "bytes": os.path.getsize(path), "seconds": round(time.time() - t0, 2)}
     if scn is None:
@@ -550,38 +449,99 @@ def _inject(ns, name, mod):
         ns[name] = mod
 
 
+HELPER_FILES = ("builders.py", "queries.py")  # B and Q: their frames say which apex call failed inside a helper
+
+
 def script_traceback(exc):
-    """Traceback limited to the user's script frames plus the exception line: the worker's
-    exec frame and Apex's internal (smodules) frames say nothing about the script."""
-    frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == SCRIPT]
+    """Traceback limited to the script's frames and the B / Q helpers' plus the exception line: the
+    worker's exec frame and Apex's internal (smodules) frames say nothing about the script."""
+    frames = [f for f in traceback.extract_tb(exc.__traceback__)
+              if f.filename == SCRIPT or os.path.basename(f.filename) in HELPER_FILES]
     lines = (["Traceback (script frames):\n"] + traceback.format_list(frames)) if frames else []
     return "".join(lines + traceback.format_exception_only(type(exc), exc))
 
 
-def m_run_apex_python(p):
+def script_error(exc, code):
+    """{type, message, line, source, calls}: where the script failed and which apex calls are on
+    that line, resolved in the failing frame (so the server can attach their signatures)."""
+    info = {"type": type(exc).__name__, "message": str(exc)[:600]}
+    last, tb = None, exc.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename == SCRIPT:
+            last = tb
+        tb = tb.tb_next
+    if last is None:
+        line = getattr(exc, "lineno", None) if isinstance(exc, SyntaxError) else None
+        if line:
+            info["line"] = line
+        return info
+    info["line"] = last.tb_lineno
+    lines = code.splitlines()
+    if 0 < last.tb_lineno <= len(lines):
+        info["source"] = lines[last.tb_lineno - 1].strip()[:300]
+    try:
+        info["calls"] = IN.failing_calls(code, last.tb_lineno, last.tb_frame, ensure_apex(),
+                                         position=IN.tb_position(last))
+    except Exception as e:  # never let the diagnosis hide the error itself
+        info["calls_error"] = str(e)[:200]
+    return info
+
+
+def _snapshot():
+    try:
+        return FX.snapshot(sys.modules[__name__], float(cfg("effects_budget_s")), bool(cfg("effects_mesh_counts")))
+    except Exception as exc:
+        log("effects snapshot failed", exc)
+        return {"failed": str(exc)[:200]}
+
+
+def _effects(before):
+    if "failed" in before:
+        return {"error": "snapshot before the script failed: " + before["failed"]}
+    after = _snapshot()
+    if "failed" in after:
+        return {"error": "snapshot after the script failed: " + after["failed"]}
+    return FX.receipt(before, after)
+
+
+def script_namespace():
+    """The namespace scripts run in (kept between calls), with apex and the helpers in it."""
     if STATE["ns"] is None:
         STATE["ns"] = {"__name__": "__mcp__"}
     ns = STATE["ns"]
-    _inject(ns, "Q", Q)
+    _inject(ns, "Q", Q)  # read helpers
+    _inject(ns, "B", B)  # model-building helpers
     _inject(ns, "S", S)
-    if p.get("attach", True):
-        ns["apex"] = ensure_apex()
+    ns["apex"] = ensure_apex()
+    return ns
+
+
+def m_run_apex_python(p):
+    ns = script_namespace()
     code = p["code"]
-    log_path = os.path.join(out_dir("scripts"), "script_%s.py" % stamp())
+    query = p.get("mode") == "query"  # query_apex_python: the server checked it reads only
+    log_path = os.path.join(out_dir("scripts"), "%s_%s.py" % ("query" if query else "script", stamp()))
     with open(log_path, "w", encoding="utf-8") as fh:
-        fh.write("# run_apex_python %s\n%s\n" % (datetime.datetime.now().isoformat(), code))
+        fh.write("# %s %s\n%s\n" % ("query_apex_python" if query else "run_apex_python",
+                                    datetime.datetime.now().isoformat(), code))
     # source for the traceback lines (mtime None: linecache.checkcache leaves it alone)
     linecache.cache[SCRIPT] = (len(code), None, code.splitlines(True), SCRIPT)
     ns.pop("result", None)
+    # a query is always snapshotted: the receipt is what shows it really changed nothing
+    track = query or bool(p.get("effects", True))
+    before = _snapshot() if track else None
     buf = io.StringIO()
-    err = None
+    err = info = None
     t0 = time.time()
     with contextlib.redirect_stdout(buf):
         try:
             exec(compile(code, SCRIPT, "exec"), ns)  # noqa: S102 - the user asked for a raw tool
         except BaseException as exc:  # sys.exit() too: its output and error must still come back
             err = script_traceback(exc)
+            info = script_error(exc, code)
     out = {"stdout": buf.getvalue()[-20000:], "seconds": round(time.time() - t0, 3), "logged_to": log_path}
+    if before is not None:  # also after a failure: a script that raised halfway may have changed things
+        out["effects"] = _effects(before)
     if "result" in ns:
         res = S.to_json(ns["result"], depth=4)
         size_kb = len(json.dumps(res, default=str)) / 1024.0
@@ -595,14 +555,15 @@ def m_run_apex_python(p):
             out["result"] = res
     if err:
         out["traceback"] = err[-8000:]
+        out["error"] = info
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write("\n# --- outcome: %s, %.3fs\n" % ("error" if err else "ok", out["seconds"]))
     return out
 
 
 METHODS = {name[2:]: fn for name, fn in globals().items() if name.startswith("m_") and callable(fn)}
-METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in B.TOOLS.items()})
 METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in SC.TOOLS.items()})
+METHODS.update({name: (lambda fn: lambda p: fn(sys.modules[__name__], p))(fn) for name, fn in IN.TOOLS.items()})
 
 
 def handle_request(req):
@@ -625,5 +586,7 @@ def handle_request(req):
         return {"id": rid, "ok": True, "result": res}
     except BaseException as exc:
         log("error", method, exc)
+        if getattr(exc, "quiet", False):  # an expected refusal or lookup miss: the message says it all
+            return {"id": rid, "ok": False, "error": str(exc)}
         return {"id": rid, "ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc()[-6000:]}
