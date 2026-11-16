@@ -232,8 +232,11 @@ class Model(Part):
     def getAssemblies(self, recursive=False): return Coll(ASSEMBLIES)
     def createPart(self, *, name):
         p = Part(name, self.pathName + "/" + name); PARTS.append(p); return p
-    def setCurrentPart(self, *, pathName):
-        self.current = next(p for p in PARTS if p.pathName == pathName); return self.current
+    def setCurrentPart(self, *, pathName):  # like Apex 2024.1: the path below the model, not the full one
+        found = [p for p in PARTS if p.pathName == self.pathName + "/" + pathName]
+        if not found:
+            raise RuntimeError("Specified part is invalid in this Model")
+        self.current = found[0]; return self.current
     def exportFEModel(self, *, filename, unitSystem):
         _check_units(unitSystem); _write_bdf(filename, None)
 
@@ -285,8 +288,8 @@ catalog = types.SimpleNamespace(
     getMaterials=lambda target=None: Coll([Named("Al 2024-T3"), Named("CFRP_UD")] + list(W["materials"].values())),
     getMaterialDictionary=lambda: dict(W["materials"]),
     getAssignedMaterials=lambda: Coll([Named("CFRP_UD")]),
-    getPropertiesElement2Ds=lambda target=None: Coll([Named("PCOMP_skin")]),
-    getPropertiesElement3Ds=lambda target=None: Coll(W["props3d"].values()),
+    getPropertiesElement2Ds=lambda target=None: Coll([Named("PCOMP_skin")] if target else []),
+    getPropertiesElement3Ds=lambda target=None: Coll(W["props3d"].values() if target else []),  # Apex: none for []
     getPropertiesElement3DDictionary=lambda: dict(W["props3d"]),
     getBeamShapeDictionary=lambda: dict(W["shapes"]),
     createMaterial=_create_material, createPropertiesElement3D=_create_prop3d)
@@ -308,15 +311,16 @@ class Scn:
 
 
 class Command:
-    def __init__(self): self.value, self.active = None, False
-    def setValue(self, v): self.value = v
+    def __init__(self, name=""): self.name, self.value, self.active = name, None, False
+    def setValue(self, v):  # Apex 2024.1: BCONTACT keeps only a string; an int is stored as nothing
+        self.value = None if self.name == "BCONTACT" and not isinstance(v, str) else v
     def getValue(self): return self.value
 
 
 class Subcase:
     def __init__(self, i): self.name, self.i, self.cmds = "Subcase %d" % i, i, {}
-    def getCommand(self, *, commandName): return self.cmds.setdefault(commandName, Command())
-    def setCommand(self, *, commandName, activate): self.cmds.setdefault(commandName, Command()).active = activate
+    def getCommand(self, *, commandName): return self.cmds.setdefault(commandName, Command(commandName))
+    def setCommand(self, *, commandName, activate): self.cmds.setdefault(commandName, Command(commandName)).active = activate
     def setName(self, n): self.name = n
     def setLabel(self, n): pass
     def setSubtitle(self, n): pass
@@ -516,7 +520,12 @@ class Tie(Named):
 
 
 class Interaction(Named):
-    def createInteractionRep(self, *, name, interactionType, interactionPropertyGeometric): self.rep = name
+    def getContactBodies1(self): return Coll([Named("Deform Body a", "/Deform Body a", self.id + 2000)])
+    def getContactBodies2(self): return Coll([Named("Deform Body b", "/Deform Body b", self.id + 3000)])
+
+    def createInteractionRep(self, *, name, interactionType, interactionPropertyGeometric):
+        self.rep = Named(name, None, self.id + 1000)  # its id is the BCONECT id Apex writes
+    def getActiveRep(self): return getattr(self, "rep", None)
 
 
 def _model_list(key):

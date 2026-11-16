@@ -63,10 +63,8 @@ def _sections(W, apex, model, budget):
 
     def properties():
         out = []
-        for name in ("getPropertiesElement2Ds", "getPropertiesElement3Ds"):
-            fn = getattr(apex.catalog, name, None)
-            if fn is not None:
-                out += _names(Q.safe(lambda: fn(target=[])))
+        for kind in ("2D", "3D"):
+            out += _names(Q.safe(lambda k=kind: Q.element_properties(apex, k)))
         return out
 
     return (("loads", lambda: _names(apex.environment.getLoads())),

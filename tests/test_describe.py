@@ -16,7 +16,6 @@ import apex as FAKE  # noqa: E402  (the fake, for entities)
 import describe_text as DT  # noqa: E402
 import introspect as IN  # noqa: E402
 import serialize as S  # noqa: E402
-import skills  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="apexmcp_describe_")
 
@@ -97,7 +96,7 @@ def test_enum_class_method_and_property():
     assert r["properties"]["names"] == ["elements", "name"] and r["methods"]["names"] == ["getMeshes", "hide", "update"], r
     r = d("apex.Part.getMeshes")
     assert r["kind"] == "method" and r["signature"] == {"params": [], "returns": "MeshBodyCollection"}, r
-    assert r["owner"] == "Part" and r["owner_bases"] == ["Entity"], r
+    assert r["owner"] == "Part", r
     assert d("apex.Part.name") == {"target": "apex.Part.name", "kind": "property", "owner": "Part"}
     assert d("apex.Part", flt="mesh")["methods"]["names"] == ["getMeshes"]
 
@@ -147,7 +146,7 @@ def test_limit_caps_values_read_and_names_the_rest():
     r = IN.describe(FAKE, "$o", ns={"o": o}, limit=2)
     assert list(r["properties"]) == ["a", "b"] and r["not_shown"] == ["c", "d"], r
     assert r["not_read"] == ["elements"], r  # skipped names do not use up the limit
-    assert "not shown (limit reached" in DT.format_describe(r, None, {})
+    assert "not shown (limit reached" in DT.format_describe(r)
 
 
 def test_values_are_summarised():
@@ -182,54 +181,30 @@ def write(path, text):
         fh.write(text)
 
 
-def skill():
-    api = os.path.join(TMP, "skill", "api")
-    write(os.path.join(api, "modules", "apex.mesh.md"),
-          "## apex.mesh\n\n### `apex.mesh.createSolidMesh(name: str, target: apex.EntityCollection) -> None`\nMesh.\n")
-    write(os.path.join(api, "modules", "apex.md"), "## apex\n\n### `apex.getEntities(pathNames: [str]) -> apex.EntityCollection`\nGet.\n")
-    write(os.path.join(api, "enums.md"), "- `apex.mesh.SurfaceMeshElementShape`: `Mixed`, `Quadrilateral`, `Triangle`\n"
-                                         "- `apex.attribute.ApplicationMethod`: `Direct`, `Remote`\n")
-    write(os.path.join(api, "classes.md"), "- `apex.Part` extends Entity — A part.\n- `apex.Entity` — Base.\n")
-    write(os.path.join(api, "classes", "apex.md"),
-          "## `apex.Entity`\nBase.\n\nMethods:\n\n- `hide() -> None` — Hide this Entity.\n\n"
-          "## `apex.Part`  (extends `Entity`)\nA part.\n\nMethods:\n\n- `getMeshes() -> MeshBodyCollection` — Meshes.\n")
-    write(os.path.join(api, "methods-index.md"), "- `apex.Entity.hide` — Hide this Entity. (inherited by 404 classes)\n"
-                                                  "- `apex.Part.getMeshes` — Meshes.\n")
-    write(os.path.join(api, "functions-index.md"), "")
-    return skills.ApexScriptingSkill(os.path.dirname(api))
-
-
-def test_text_marks_undocumented_and_elsewhere_and_merges_signatures():
-    sk = skill()
-    mesh = dict(d("apex.mesh"), enums={"names": ["ApplicationMethod", "Nope", "SurfaceMeshElementShape"]})
-    t = DT.format_describe(mesh, sk)
-    assert "ApplicationMethod^" in t and "Nope*" in t and "SurfaceMeshElementShape\n" in t and "createSolidMesh" in t, t
-    assert "^ = documented under another module" in t and "1 from apex.attribute" in t, t
-    t = DT.format_describe(d("apex.mesh.createSolidMesh"), sk)
-    assert "runtime:   apex.mesh.createSolidMesh(*args, **kwargs)" in t, t
-    assert "reference: apex.mesh.createSolidMesh(name: str, target: apex.EntityCollection) -> None" in t, t
-    t = DT.format_describe(d("apex.getEntities"), sk)
-    assert "runtime:   apex.getEntities(pathNames: [str]) -> EntityCollection" in t, t
-    t = DT.format_describe(d("apex.mesh.SurfaceMeshElementShape"), sk)
-    assert "Undefined=3*" in t and "Mixed=0," in t, t
-    t = DT.format_describe(d("apex.Part"), sk)
-    assert "A part." in t and "hide," in t and "update*" in t and "getMeshes," in t, t  # hide: inherited, via the MRO
-    t = DT.format_describe(d("apex.Part.hide"), sk)
-    assert "reference: Part.hide() -> None — Hide this Entity. (inherited from apex.Entity)" in t, t
-    t = DT.format_describe(IN.describe(FAKE, "$p", ns={"p": FAKE.PARTS[0]}, ref=S.ref), sk)
+def test_text_is_what_this_apex_has():
+    t = DT.format_describe(d("apex.mesh"))
+    assert "createSolidMesh" in t and "SurfaceMeshElementShape" in t and "1 from apex.attribute" in t, t
+    assert "*" not in t.replace("**", ""), t  # no comparison with a reference any more
+    t = DT.format_describe(d("apex.mesh.createSolidMesh"))
+    assert "apex.mesh.createSolidMesh(*args, **kwargs)  (Apex does not expose the argument names)" in t, t
+    t = DT.format_describe(d("apex.getEntities"))
+    assert "apex.getEntities(pathNames: [str]) -> EntityCollection" in t, t
+    t = DT.format_describe(d("apex.mesh.SurfaceMeshElementShape"))
+    assert "Undefined=3" in t and "Mixed=0," in t, t
+    t = DT.format_describe(d("apex.Part"))
+    assert "hide," in t and "update" in t and "getMeshes," in t, t  # hide: inherited, via the MRO
+    t = DT.format_describe(IN.describe(FAKE, "$p", ns={"p": FAKE.PARTS[0]}, ref=S.ref))
     assert "name = 'PID53'" in t and "not read" in t and "elements" in t and "update(...)" in t, t
-    t = DT.format_describe({"target": "apex.ConstraintAxis", "kind": "enum", "members": {"X": 0}},
-                           sk, {"moved": {"apex.ConstraintAxis": "apex.session.ConstraintAxis"}})
-    assert "in this Apex it is apex.session.ConstraintAxis" in t, t
 
 
-def test_method_signature_follows_the_runtime_bases():
-    sk = skill()
-    assert sk.method_signature("Part", "hide") == []  # the index does not name Part among the 404 heirs
-    assert sk.method_signature("Part", "hide", ["Entity"]) == \
-        ["Part.hide() -> None — Hide this Entity. (inherited from apex.Entity)"]
-    assert sk.documented_methods("Part") == {"getMeshes"}
-    assert sk.documented_methods("Part", ["Entity"]) == {"getMeshes", "hide"}
+def test_failing_call_line_points_to_the_skill_only_when_apex_hides_the_names():
+    t = DT.call_line({"name": "apex.getEntities", "kind": "function",
+                      "signature": {"params": [{"name": "pathNames", "type": "[str]"}]}})
+    assert t == "apex.getEntities(pathNames: [str])", t
+    t = DT.call_line({"name": "apex.mesh.createSolidMesh", "kind": "function", "signature": {"star": True}})
+    assert "(*args, **kwargs)" in t and "api/modules/apex.mesh.md" in t, t
+    t = DT.call_line({"name": "Part.update", "kind": "method", "module": "apex", "signature": {"unknown": True}})
+    assert "Part.update(?)" in t and "api/modules/apex.md" in t, t
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
-"""Idempotent model builders, one MCP tool each (run in-process on Apex's script thread).
+"""Model-building helpers for scripts: `B` in the run_apex_python namespace.
 
-Thin wrappers over calls proven in real Apex 2024.1 sessions (output/scripts):
+    B.create_material(name="Ti64", E=113800.0, nu=0.342, rho=4.43e-9)
+    B.assign_solid_property(paths=["base/Asm"], material="Ti64")
+    B.mesh_solid(paths=["base/Asm"], size=3.0)
+
+Thin wrappers over calls proven in real Apex 2024.1 sessions:
   MAT1          catalog.createMaterial + getMaterialModel("MAT1").update(materialProperties=)
   PSOLID        catalog.createPropertiesElement3D + getProperties3DModel("PSOLID").update(MID=)
                 + attribute.assignPropertiesElement3D
@@ -12,16 +16,25 @@ Thin wrappers over calls proven in real Apex 2024.1 sessions (output/scripts):
   FORCE/MOMENT  environment.createLoadForceComponent / createLoadMomentComponent
   SOL 101       Study.createScenarioNastran + per-subcase LOAD / SPC / BCONTACT commands
 
-Calling a builder again with the same name (or, for rbe2, the same reference node)
-replaces what the earlier call made instead of adding a duplicate. Results are ids and
-counts only. Every function takes (W, p); W is the apex_worker module.
+Every helper CHANGES THE MODEL and is idempotent: calling it again with the same name (for rbe2,
+the same reference node) replaces what the earlier call made instead of adding a duplicate. They
+return ids and counts only.
+
+Targets: a pathName (the whole part/solid/surface), {"path": part, "faces": [face ids]} (ids from
+the list_faces tool), {"path": part, "nodes": [node ids]}, or a list of these.
 """
 import queries as Q
 
 DOF_KEYS = ("translationX", "translationY", "translationZ", "rotationX", "rotationY", "rotationZ")
 
 
-# ------------------------------------------------------------------ helpers
+def _W():
+    """The worker module (it imports this one, so it is looked up when a helper runs)."""
+    import apex_worker
+    return apex_worker
+
+
+# ------------------------------------------------------------------ internals
 def _named(items, name):
     for e in items or []:
         if Q.safe(lambda e=e: e.name) == name:
@@ -42,7 +55,7 @@ def _delete(apex, ents):
 
 
 def _vec3(what, values):
-    """Three floats, checked before a builder deletes what it is about to replace."""
+    """Three floats, checked before a helper deletes what it is about to replace."""
     try:
         vec = [float(c) for c in values]
     except (TypeError, ValueError):
@@ -52,35 +65,14 @@ def _vec3(what, values):
     return vec
 
 
-def _model_getter(W, fn):
+def _model_getter(fn):
+    W = _W()
     return list(W._call_getter(fn, W.ensure_apex().currentModel()) or [])
 
 
-def targets(W, spec):
-    """EntityCollection from a target spec: a pathName (the whole part/solid/surface), or
-    {"path": part, "faces": [ids]}, or {"path": part, "nodes": [ids]}, or a list of these."""
-    if isinstance(spec, (str, dict)):
-        spec = [spec]
-    items = []
-    for t in spec or []:
-        if isinstance(t, str):
-            items.extend(list(W.entities_by_path([t])))
-            continue
-        ent = W.one_entity(t["path"])
-        if t.get("faces"):
-            items.extend(list(Q.faces_by_id(ent, t["faces"])))
-        elif t.get("nodes"):
-            items.extend(list(Q.nodes_by_id(ent, t["nodes"])))
-        else:
-            items.append(ent)
-    if not items:
-        raise ValueError("empty target")
-    return Q.collection(items)
-
-
-def ensure_part(W, path):
+def _ensure_part(path):
     """(part, created): the part at path, created under its parent assembly if missing."""
-    apex = W.ensure_apex()
+    apex = _W().ensure_apex()
     part = Q.safe(lambda: apex.getPart(pathName=path))
     if part is not None:
         return part, False
@@ -101,13 +93,13 @@ def _material(apex, name):
 def _need_material(apex, name):
     m = _material(apex, name)
     if m is None:
-        raise KeyError("no material '%s' (create_material first)" % name)
+        raise KeyError("no material '%s' (B.create_material first)" % name)
     return m
 
 
-def _solids(W, paths):
+def _solids(paths):
     out = []
-    for e in W.parts_from(paths):
+    for e in _W().parts_from(paths):
         out.extend(list(Q.safe(lambda e=e: e.getSolids()) or []) if hasattr(e, "getSolids") else [e])
     if not out:
         raise ValueError("no solids under %s" % paths)
@@ -133,14 +125,38 @@ def _mesh_counts(meshes):
     return ne, nn
 
 
-# ------------------------------------------------------------------ builders
-def create_material(W, p):
-    apex = W.ensure_apex()
-    name = p["name"]
-    props = {"E": float(p["E"]), "NU": float(p["nu"])}
-    if p.get("rho") is not None:
-        props["RHO"] = float(p["rho"])
-    props.update(p.get("extra") or {})
+# ------------------------------------------------------------------ helpers
+def targets(spec):
+    """apex.EntityCollection from a target spec: a pathName (the whole part/solid/surface),
+    {"path": part, "faces": [ids]}, {"path": part, "nodes": [ids]}, or a list of these. Reads only."""
+    W = _W()
+    if isinstance(spec, (str, dict)):
+        spec = [spec]
+    items = []
+    for t in spec or []:
+        if isinstance(t, str):
+            items.extend(list(W.entities_by_path([t])))
+            continue
+        ent = W.one_entity(t["path"])
+        if t.get("faces"):
+            items.extend(list(Q.faces_by_id(ent, t["faces"])))
+        elif t.get("nodes"):
+            items.extend(list(Q.nodes_by_id(ent, t["nodes"])))
+        else:
+            items.append(ent)
+    if not items:
+        raise ValueError("empty target")
+    return Q.collection(items)
+
+
+def create_material(name, E, nu, rho=None, extra=None):
+    """Create or update an isotropic MAT1 material in script units (e.g. mm-t-s-N: E in MPa, rho in
+    t/mm^3). extra: further MAT1 fields by Apex name."""
+    apex = _W().ensure_apex()
+    props = {"E": float(E), "NU": float(nu)}
+    if rho is not None:
+        props["RHO"] = float(rho)
+    props.update(extra or {})
     mat = _material(apex, name)
     created = mat is None
     if created:
@@ -149,28 +165,34 @@ def create_material(W, p):
     return {"material": name, "id": mat.id, "created": created}
 
 
-def assign_solid_property(W, p):
-    apex = W.ensure_apex()
-    mat = _need_material(apex, p["material"])
-    name = p.get("name") or "PSOLID_" + p["material"]
+def assign_solid_property(paths, material, name=None):
+    """Create or update a PSOLID (default name PSOLID_<material>) pointing at `material` and assign
+    it to every solid of the given parts/assemblies (or the given solids)."""
+    apex = _W().ensure_apex()
+    mat = _need_material(apex, material)
+    name = name or "PSOLID_" + material
     prop = Q.safe(lambda: apex.catalog.getPropertiesElement3DDictionary()[name])
     if prop is None:
-        prop = _named(Q.safe(lambda: apex.catalog.getPropertiesElement3Ds(target=[])), name)
+        prop = _named(Q.safe(lambda: Q.element_properties(apex, "3D")), name)
     created = prop is None
     if created:
         prop = apex.catalog.createPropertiesElement3D(name=name, primaryProperties3D="PSOLID")
     prop.getProperties3DModel(properties3DModel="PSOLID").update(elementProperties3D={"MID": mat.id})
-    solids = _solids(W, p["paths"])
+    solids = _solids(paths)
     apex.attribute.assignPropertiesElement3D(target=Q.collection(solids), property=prop)
     return {"property": name, "id": prop.id, "material_id": mat.id, "solids": len(solids), "created": created}
 
 
-def mesh_solid(W, p):
+def mesh_solid(paths, size, order="Quadratic", name=None):
+    """Tet-mesh the solids of each part (createSolidMesh, order Quadratic | Linear), first deleting
+    the meshes already on those solids, so a re-mesh replaces rather than duplicates. Ties to mesh
+    nodes of a replaced mesh are lost; ties to faces survive. Returns element/node counts per part."""
+    W = _W()
     apex = W.ensure_apex()
-    size = float(p["size"])
-    order = W.enum(apex.mesh.ElementOrder, p.get("order") or "Quadratic", "order")
+    size = float(size)
+    order = W.enum(apex.mesh.ElementOrder, order or "Quadratic", "order")
     out = []
-    for part in W.parts_from(p["paths"]):
+    for part in W.parts_from(paths):
         rec = {"path": Q.safe(lambda: part.pathName)}
         solids = list(Q.safe(lambda: part.getSolids()) or [])
         if not solids:
@@ -179,7 +201,7 @@ def mesh_solid(W, p):
             continue
         keys = {Q.safe(lambda s=s: s.pathName) for s in solids}
         rec["replaced"] = _delete(apex, [m for m in Q.meshes_of(part) if _geometry_path(m) in keys])
-        apex.mesh.createSolidMesh(name=p.get("name") or "Mesh_" + Q.name_of(part),
+        apex.mesh.createSolidMesh(name=name or "Mesh_" + Q.name_of(part),
                                   target=Q.collection(solids), meshSize=size, elementOrder=order)
         mine = [m for m in Q.meshes_of(part) if _geometry_path(m) in keys]
         rec["meshes"] = len(mine)
@@ -191,14 +213,21 @@ def mesh_solid(W, p):
     return {"parts": out}
 
 
-def glue(W, p):
+def glue(name, side1, side2, tolerance=0.5, type="Glue"):
+    """Manual interaction pair between two targets (typically faces: {"path": part, "faces": [ids]}),
+    with a manual contact tolerance (script length units). type: apex.attribute.InteractionType
+    member. Nastran ignores it without BCONTACT in the subcases (static_scenario sets it)."""
+    W = _W()
     apex = W.ensure_apex()
-    name = p["name"]
-    itype = W.enum(apex.attribute.InteractionType, p.get("type") or "Glue", "type")
-    s1, s2 = targets(W, p["side1"]), targets(W, p["side2"])
-    replaced = _delete(apex, [_named(_model_getter(W, apex.attribute.getInteractions), name)])
-    kw = {"contactToleranceCalculationMethod": apex.AutoManual.Manual,
-          "contactTolerance": float(p.get("tolerance", 0.5))}
+    itype = W.enum(apex.attribute.InteractionType, type or "Glue", "type")
+    s1, s2 = targets(side1), targets(side2)
+    old = _named(_model_getter(apex.attribute.getInteractions), name)
+    bodies = []  # Apex leaves the old pair's contact bodies behind, and they export as unused BCSURFs
+    if old is not None:
+        for getter in ("getContactBodies1", "getContactBodies2"):
+            bodies += list(Q.safe(lambda g=getter: getattr(old, g)()) or [])
+    replaced = _delete(apex, [old] + bodies)
+    kw = {"contactToleranceCalculationMethod": apex.AutoManual.Manual, "contactTolerance": float(tolerance)}
     try:
         geo = apex.attribute.createInteractionPropertyGeometric(name=name + "_geom", **kw)
     except Exception:  # name left over from an earlier call: let Apex name it
@@ -209,34 +238,38 @@ def glue(W, p):
             "replaced": bool(replaced)}
 
 
-def _ref_node(W, p, tol):
+def _ref_node(ref, node_part, tol):
     """(node, created) for rbe2's ref: {"path": part, "node": id} or [x, y, z] in node_part."""
+    W = _W()
     apex = W.ensure_apex()
-    ref = p["ref"]
     if isinstance(ref, dict):
         return list(Q.nodes_by_id(W.one_entity(ref["path"]), [ref["node"]]))[0], False
     xyz = [float(c) for c in ref]
-    if not p.get("node_part"):
+    if not node_part:
         raise ValueError("ref=[x,y,z] needs node_part: the part to find (within tol) or create the node in")
-    part, _ = ensure_part(W, p["node_part"])
+    part, _ = _ensure_part(node_part)
     node = Q.node_near(part, xyz, tol)
     if node is not None:
         return node, False
     return apex.mesh.createNodeByLocation(coordinates=apex.Coordinate(*xyz), pathName=part.pathName), True
 
 
-def rbe2(W, p):
-    apex = W.ensure_apex()
-    tol = float(p.get("tol", 0.01))
-    region = targets(W, p["attach"])
-    node, created = _ref_node(W, p, tol)
+def rbe2(ref, attach, dof="123456", node_part=None, tol=0.01):
+    """Rigid node tie (RBE2) from a reference node to `attach` (a target: faces or nodes). ref is
+    {"path": part, "node": id} (e.g. a beam end node from beam) or [x, y, z]: an existing node of
+    node_part within tol, else a new node there (node_part is created if missing). A tie already
+    on that reference node is replaced."""
+    apex = _W().ensure_apex()
+    tol = float(tol)
+    region = targets(attach)
+    node, created = _ref_node(ref, node_part, tol)
     nid = int(node.id)
-    old = [t for t in _model_getter(W, apex.attribute.getNodeTies)
+    old = [t for t in _model_getter(apex.attribute.getNodeTies)
            if Q.safe(lambda t=t: int(t.getReferencePoint().id)) == nid]
     if old:
         _delete(apex, old)
-        node, created = _ref_node(W, p, tol)  # deleting a tie can delete its free reference node
-    tie = apex.attribute.createNodeTie(referencePoint=node, dependentDoF=str(p.get("dof") or "123456"),
+        node, created = _ref_node(ref, node_part, tol)  # deleting a tie can delete its free reference node
+    tie = apex.attribute.createNodeTie(referencePoint=node, dependentDoF=str(dof or "123456"),
                                        attachmentRegions=region,
                                        distributionType=apex.attribute.DistributionType.Rigid)
     return {"tie_id": Q.safe(lambda: tie.id), "ref_node": int(node.id), "ref_node_created": created,
@@ -244,14 +277,17 @@ def rbe2(W, p):
             "regions": region.len(), "replaced": len(old)}
 
 
-def beam(W, p):
+def beam(name, points, radius, material, mesh_size, part, order="Linear"):
+    """Solid-round beam (e.g. bolt shank or pin) along a polyline through `points`, in `part`
+    (created if missing): curve, round BeamShape, free BeamSpan with `material`, curve mesh named
+    BeamMesh_<name>. Returns nodes_at_points: the mesh node id at each point, ready for rbe2's ref."""
+    W = _W()
     apex = W.ensure_apex()
-    name = p["name"]
-    pts = [[float(c) for c in pt] for pt in p["points"]]
+    pts = [[float(c) for c in pt] for pt in points]
     if len(pts) < 2:
         raise ValueError("points needs at least two [x, y, z]")
-    mat = _need_material(apex, p["material"])
-    part, _ = ensure_part(W, p["part"])
+    mat = _need_material(apex, material)
+    part, _ = _ensure_part(part)
     mesh_name = "BeamMesh_" + name
 
     def ours(m):
@@ -259,12 +295,15 @@ def beam(W, p):
         return n == mesh_name or n.startswith(mesh_name + " ")
     old = [m for m in Q.meshes_of(part) if ours(m)]
     replaced = _delete(apex, old + [_geometry_body(m) for m in old])  # the meshes and their curves
-    apex.currentModel().setCurrentPart(pathName=part.pathName)  # createCurve builds in the current part
+    model = apex.currentModel()
+    # createCurve builds in the current part; setCurrentPart wants the path below the model:
+    # 'Asm/Part', not 'base/Asm/Part' ("Specified part is invalid in this Model", Apex 2024.1)
+    model.setCurrentPart(pathName=part.pathName[len(model.pathName) + 1:])
     locs = apex.ILocationCollection()
     locs.appendList([apex.Coordinate(*x) for x in pts])
     curve = apex.geometry.createCurve(target=locs, behavior=apex.geometry.CurveBehavior.Polyline)
     Q.safe(lambda: curve.update(name=name))
-    radius = float(p["radius"])
+    radius = float(radius)
     shape_name = "Round_R%g" % radius
     shape = Q.safe(lambda: apex.catalog.getBeamShapeDictionary()[shape_name])
     if shape is None:
@@ -272,8 +311,8 @@ def beam(W, p):
     edges = apex.geometry.EdgeCollection()
     edges.appendList(list(curve.getEdges()))
     spans = apex.attribute.createBeamSpanFree(name="Span_" + name, beamTarget=edges, shapeEndA=shape, material=mat)
-    order = W.enum(apex.mesh.ElementOrder, p.get("order") or "Linear", "order")
-    apex.mesh.createCurveMesh(name=mesh_name, target=Q.collection([curve]), meshSize=float(p["mesh_size"]),
+    order = W.enum(apex.mesh.ElementOrder, order or "Linear", "order")
+    apex.mesh.createCurveMesh(name=mesh_name, target=Q.collection([curve]), meshSize=float(mesh_size),
                               elementOrder=order)
     mine = [m for m in Q.meshes_of(part) if ours(m)]
     at = []
@@ -286,21 +325,25 @@ def beam(W, p):
             "replaced": bool(replaced)}
 
 
-def constrain(W, p):
+def constrain(name, target, type="Clamped", dof=None, id=None):
+    """Displacement constraint (SPC) on a target. type: Clamped | Symmetry | Spherical | Axial |
+    General. dof (e.g. "123") fixes only those components through type General; that path is not
+    yet proven in Apex, so check the SPC cards of the exported deck. Re-creating keeps the old SPC
+    set id unless id is given."""
+    W = _W()
     apex = W.ensure_apex()
-    name = p["name"]
-    if p.get("dof") and not set(str(p["dof"])) <= set("123456"):
-        raise ValueError("dof must use the digits 1-6, e.g. \"123\": got %r" % (p["dof"],))
-    tgt = targets(W, p["target"])
+    if dof and not set(str(dof)) <= set("123456"):
+        raise ValueError("dof must use the digits 1-6, e.g. \"123\": got %r" % (dof,))
+    tgt = targets(target)
     kw = {"name": name, "target": tgt, "applicationMethod": apex.attribute.ApplicationMethod.Direct}
-    if p.get("dof"):
+    if dof:
         kw["constraintType"] = apex.attribute.ConstraintType.General
-        kw.update({key: 0.0 for d, key in zip("123456", DOF_KEYS) if d in str(p["dof"])})
+        kw.update({key: 0.0 for d, key in zip("123456", DOF_KEYS) if d in str(dof)})
     else:
-        kw["constraintType"] = W.enum(apex.attribute.ConstraintType, p.get("type") or "Clamped", "type")
+        kw["constraintType"] = W.enum(apex.attribute.ConstraintType, type or "Clamped", "type")
     old = _named(apex.environment.getConstraints() or [], name)
-    if p.get("id") is not None:
-        kw["id"] = int(p["id"])
+    if id is not None:
+        kw["id"] = int(id)
     elif old is not None:
         kw["id"] = int(old.id)  # keep the SPC set id that scenarios already point at
     replaced = _delete(apex, [old])
@@ -308,22 +351,24 @@ def constrain(W, p):
     return {"constraint": name, "id": Q.safe(lambda: c.id), "targets": tgt.len(), "replaced": bool(replaced)}
 
 
-def nodal_load(W, p):
-    apex = W.ensure_apex()
-    name = p["name"]
-    if (p.get("force") is None) == (p.get("moment") is None):
+def nodal_load(name, target, force=None, moment=None, id=None):
+    """Force [fx, fy, fz] or moment [mx, my, mz] (one per call; each is one Nastran LOAD set) applied
+    directly to a target, usually {"path": part, "nodes": [id]}. Re-creating keeps the old LOAD set
+    id unless id is given."""
+    apex = _W().ensure_apex()
+    if (force is None) == (moment is None):
         raise ValueError("give force=[fx,fy,fz] or moment=[mx,my,mz]: one per load, since each load "
                          "is one Nastran LOAD set id")
-    x, y, z = _vec3("force" if p.get("force") is not None else "moment", p.get("force") or p.get("moment"))
-    tgt = targets(W, p["target"])
+    x, y, z = _vec3("force" if force is not None else "moment", force if force is not None else moment)
+    tgt = targets(target)
     kw = {"name": name, "target": tgt, "applicationMethod": apex.attribute.ApplicationMethod.Direct}
     old = _named(apex.environment.getLoads() or [], name)
-    if p.get("id") is not None:
-        kw["id"] = int(p["id"])
+    if id is not None:
+        kw["id"] = int(id)
     elif old is not None:
         kw["id"] = int(old.id)  # keep the LOAD set id that scenarios already point at
     replaced = _delete(apex, [old])
-    if p.get("force") is not None:
+    if force is not None:
         load = apex.environment.createLoadForceComponent(forceX=x, forceY=y, forceZ=z, **kw)
     else:
         load = apex.environment.createLoadMomentComponent(momentX=x, momentY=y, momentZ=z, **kw)
@@ -333,24 +378,46 @@ def nodal_load(W, p):
 def _set_command(sub, cmd, value):
     # value first, then activate: the order that persisted in Apex 2024.1
     c = sub.getCommand(commandName=cmd)
-    try:
-        c.setValue(value)
-    except Exception:
-        c.setValue(str(value) if not isinstance(value, str) else int(value))
+    if cmd == "BCONTACT":  # setValue(value: str): an int is stored as nothing and exports as BCONTACT = USER
+        c.setValue(str(value))
+    else:
+        try:
+            c.setValue(value)
+        except Exception:
+            c.setValue(str(value) if not isinstance(value, str) else int(value))
     sub.setCommand(commandName=cmd, activate=True)
 
 
-def static_scenario(W, p):
+def _contact_id():
+    """BCONTACT for the model's interactions: the id of their InteractionRep, which Apex 2024.1
+    writes as the BCONECT id. None without interactions. One BCONTACT selects one id, so
+    interactions on several ids need an explicit choice."""
+    ids = sorted({Q.safe(lambda ia=ia: int(ia.getActiveRep().id))
+                  for ia in _model_getter(_W().ensure_apex().attribute.getInteractions)} - {None})
+    if len(ids) > 1:
+        raise ValueError("the model has interactions on several contact ids %s, and one BCONTACT selects "
+                         "one id: pass bcontact= (per subcase or for all) and check the exported deck" % ids)
+    return ids[0] if ids else None
+
+
+def static_scenario(name, subcases, model_rep=None, bcontact="auto"):
+    """SOL 101 Nastran scenario with one subcase per entry of subcases=[{"name", "load",
+    "constraint", "bcontact"?}] (load / constraint by name). Sets LOAD, SPC and BCONTACT per
+    subcase and reads them back. bcontact "auto" sets BCONTACT to the contact id of the model's
+    interactions (the id of their InteractionRep, which Apex writes as the BCONECT id), and leaves it
+    off without interactions; an int or a keyword ("ALLBODY", "NONE") sets that; None leaves it off. model_rep: assembly path (default: the only top-level
+    assembly). Replaces a scenario of the same name."""
+    W = _W()
     apex = W.ensure_apex()
-    name, subs = p["name"], p.get("subcases") or []
+    subs = subcases or []
     if not subs:
         raise ValueError("subcases: [{name, load, constraint}, ...] needs at least one entry")
     model = apex.currentModel()
     tables = {"load": {Q.name_of(x): x for x in apex.environment.getLoads() or []},
               "constraint": {Q.name_of(x): x for x in apex.environment.getConstraints() or []}}
-    bc = p.get("bcontact", "auto")
+    bc = bcontact
     if bc == "auto":
-        bc = 1 if _model_getter(W, apex.attribute.getInteractions) else None
+        bc = _contact_id()
     elif bc in ("off", "none", None):
         bc = None
     plan = []  # resolve everything before deleting the old scenario, so a typo changes nothing
@@ -363,9 +430,8 @@ def static_scenario(W, p):
                 rec[cmd] = int(tables[key][s[key]].id)
         rec["BCONTACT"] = s.get("bcontact", bc)
         plan.append(rec)
-    rep_path = p.get("model_rep")
-    if rep_path:
-        rep = W.one_entity(rep_path)
+    if model_rep:
+        rep = W.one_entity(model_rep)
     else:
         top = list(Q.safe(lambda: model.getAssemblies(recursive=False)) or [])
         if len(top) > 1:
@@ -400,7 +466,3 @@ def static_scenario(W, p):
     if bad:
         res["warning"] = "read-back differs: " + "; ".join(bad)
     return res
-
-
-TOOLS = {f.__name__: f for f in (create_material, assign_solid_property, mesh_solid, glue, rbe2, beam,
-                                 constrain, nodal_load, static_scenario)}

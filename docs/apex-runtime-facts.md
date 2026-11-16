@@ -1,59 +1,39 @@
-# Apex 2024.1 runtime facts
+# Apex 2024.1 runtime facts the server relies on
 
-Measured live in MSC Apex 2024.1 (build CLR:011290, script units mm-kg-s-N-K) through the MCP
-bridge, on a 3-part unmeshed assembly, 2026-11-13. These are facts the API reference
-(Iberian Lynx FP2 docs, `nastran-fea-skills`) gets wrong or does not state. Re-check them on a
-new Apex release before relying on them.
+Measured live in MSC Apex 2024.1 (build CLR:011290, script units mm-kg-s-N-K, Python 3.11.6) through the
+MCP bridge, on a 3-part assembly, 2026-11-13. Re-check them on a new Apex release.
 
-## API reference vs runtime
+Where Apex differs from its API reference (names in other modules or missing, positional arguments,
+assignment, enum values, expensive properties, undo) is scripting knowledge and lives in the skill:
+`skills/apex-scripting/references/runtime-2024.1.md` in
+[nastran-fea-skills](https://github.com/rehman-saif/nastran-fea-skills). This file keeps the measurements
+behind the server's own design: the script checks, `apex_describe` and the effects receipt.
 
-| Item | Documented | Present at runtime | Notes |
-|---|---|---|---|
-| Module functions | 989 | 989 | none missing |
-| Classes | 733 | 728 | `DataTable2Col`/`3Col` are in `apex.catalog`, `PointSensor` in `apex.instrument`; `LocationInternal`, `studies.ModalFrequencyStep` absent |
-| Enums | 237 | 229 | `ConstraintAxis` is `apex.session.ConstraintAxis`; absent: `attribute.ExtendedKeyword`, `KeywordMaterialPrimary`, `KeywordMaterialSecondary`, `MaterialModelType`, `MaterialTypeDomain`, `geometry.GeometryFaultType`, `GeometryFeatureType` |
-| Enum members (single-line entries) | all | all | none missing |
-| Class methods | 5104 parsed | 5104 - 236 | 220 of the 236 are generator artifacts (constructors listed as methods, `delete_RENAMED_AFTER_SWIG`); 16 are really absent (below) |
+## Signatures and errors (what the script tools rely on)
 
-Really absent methods: `Entity.asEvent`, `asLoadCase`, `asStep`; `gendes.NonDesignRegion.getLocationInternal`;
-`studies.FrequencyResponseSimulationSettings.update`; `studies.MultiBodyTransientStep.getEndTime`,
-`getOutputFrequency`, `getOutputStepSize`, `getOutputSteps`; `studies.Scenario.createDynamicStep`,
-`createStaticStep`, `getAcfCommands`, `getDynamicStep`, `getStaticStep`; `studies.Study.createScenarioMBDScripted`,
-`createScenarioMBDStandard` (multibody / step features).
-
-Undocumented but present (no docstrings, signatures unknown):
-`apex.display.rotateView`, `panView`, `zoomAtPoint`, `zoomInView`, `zoomOutView`, `checkRotatingMode`;
-`apex.geometry.createBoxByCoordinateSystem`, `createCylinderByCoordinateSystem`,
-`createEllipsoidByCoordinateSystem`, `compareModel`; `apex.runPythonScript`, `runPythonFunction`,
-`getShortPath`. The rest of the 189 undocumented callables are SWIG containers (`IntList`, `StringToStringMap`, ...).
-
-## Calling conventions and signatures (what preflight relies on)
-
-Measured on the same Apex (Python 3.11.6):
-
-- **Positional arguments work.** `apex.getEntities(["a/b"])`, `apex.mesh.getCurveMeshes([{...}])`,
-  `apex.deleteEntities(coll)` and `coll.append(p)` behave like the keyword forms. The skill's
-  "Apex accepts no positional arguments" is wrong; keywords are still the better habit.
 - **Unknown keywords fail at once, before the call runs:** `TypeError: getEntities() got an unexpected keyword
-  argument 'paths'` (Python wrappers) or `'nme' is an invalid keyword argument for Part_update()` (SWIG).
-- **Plain property assignment raises** (`AttributeError: property 'name' of 'Part' object has no setter`);
-  it does not silently do nothing. `len(collection)` works as well as `.len()`.
-- **Runtime signatures:** of the 1,297 functions found in `apex` and its modules (a re-exported function counts once per module), 827 have a real Python signature
-  (`inspect.signature` gives the parameter names and defaults) and 470 are `(*args, **kwargs)` SWIG wrappers.
-- **The documented parameter names match the runtime:** 596 of the 599 documented functions with a real signature
-  have exactly the documented names (the other 3: two empty parameter lists, one with the same names in another
-  order). For the SWIG wrappers, Apex's "takes at most N keyword arguments" equals the documented parameter count
-  for all 314 checked. So an unknown keyword against the documented list is treated as an error.
-- **Enum members the reference misses:** Apex enums are plain classes with int attributes (plus `thisown`), and
-  some have members the reference omits, e.g. `SurfaceMeshElementShape.Undefined`. Only the live index can say a
-  member is missing.
-- Modules report runtime names: `apex.mesh.__name__ == "leaf.mesh"`, `apex.construct` is `glef.construct`,
-  `apex.setting` is `clef.setting`; entity classes such as `Part` have `__module__ == "glef"`. The `apex`
-  namespace also re-exports `os`, `sys`, `site` and the plugin packages.
-- The live index (`introspect.api_index`: 34 modules, 1,257 functions, 576 enum-like classes) takes 0.18 s and
-  is 198 kB of JSON. With the method names of every class (3,092, for query_apex_python's read-only check; 106 of
-  them lower case, mostly SWIG container methods such as `push_back`, `erase`, `iteritems`) it takes 0.92 s and is
-  253 kB, built once per server session.
+  argument 'paths'` (Python wrappers) or `'nme' is an invalid keyword argument for Part_update()` (SWIG). An
+  unknown name raises `AttributeError` at its line. So a wrong call costs one round trip, and the worker adds the
+  failing call's signature to the error.
+- **Runtime signatures:** of the 1,297 functions found in `apex` and its modules (a re-exported function counts
+  once per module), 827 have a real Python signature (`inspect.signature` gives the parameter names and defaults)
+  and 470 are `(*args, **kwargs)` SWIG wrappers. The failing-call report and `apex_describe` show the first kind
+  and say so for the second.
+- **Enum values read back are ints** (`entityType` 11 for a part, `getVisibility()` 1, a scenario's
+  `executionStatus` 3), so the worker maps them to names through the enum class (`apex.Visibility`,
+  `apex.studies.ExecutionStatus`, `apex.studies.NastranSolutionType`).
+- Modules report runtime names (`apex.mesh.__name__ == "leaf.mesh"`; entity classes have `__module__ == "glef"`),
+  and the `apex` namespace re-exports `os`, `sys`, `site` and the plugin packages: `apex_describe` maps runtime
+  module names back to `apex.*` and leaves the foreign ones out.
+
+### Why names and arguments are not checked before a script runs
+
+Versions 1.2 to 1.6 checked every `apex` name, enum member and keyword of a script against an index of the running
+Apex's API (34 modules, 1,257 functions, 3,092 method names; 0.9 s and 253 kB per session). Run over the 316 saved
+scripts with a recorded outcome (2026-11-14): of the 39 that failed it would have refused 4 (two of them written
+to test it), and it refused 2 of the 277 that ran. Apex reports the same mistakes itself, at the call. The check
+and the index were removed in 2.0; the loop guard below stays because that mistake does not raise, it exhausts
+Apex's memory.
 
 ## Read or change (what query_apex_python relies on)
 
@@ -63,12 +43,14 @@ Measured on the same Apex (Python 3.11.6):
 - Read verbs: `get` (also `getuTangent`, `getisLocked`), `is`, `has`, `as`, `evaluate`, `measure`, `find`,
   `identify`, `check`, `compare`, `analyse`, `currentModel`, the `...Collection()` constructors. Exceptions:
   `geometry.findFixSmallSurfaceAndCurveFeatures` and `identifyFixSmallFeatures` repair geometry, unless called
-  with `autoFix=False` (both take it; `geometry_check` calls the first that way, so it only detects).
+  with `autoFix=False` (both take it; `Q.geometry_check` calls the first that way, so it only detects).
 - Names that change something without a create/set/delete verb: `display.render`, `captureImage`,
   `beginUndoIndent`/`endUndoIndent`, `undo`/`redo`, `showAll`/`hideAll`/`showUI`/`hideUI`, camera `viewFromX`,
   `viewIsometric_1`, `rotate`, `zoom`, `pan`, `dolly`, `roll`, `pitch`, `yaw`, `reset`.
 - `apex.setScriptUnitSystem` changes only the units scripts use; 11 saved scripts start with it, so a query
   allows it.
+- The read-only rule is by these names only. It needs no index of Apex's API: a call of `apex.<...>.<name>` is a
+  class or enum when the name is capitalised, otherwise a function judged by its verb.
 - In the 312 scripts saved so far, the most common changes were `beginUndoIndent` (49), `deleteEntities` (32),
   `display.render` (25), `exportFEModel` (23), `update` (20) and camera setters (`setFocalPoint` 19,
   `setParallelScale` 18, `setPosition` 17).
@@ -76,41 +58,26 @@ Measured on the same Apex (Python 3.11.6):
 
 ## Introspection (what apex_describe relies on)
 
-- **No docstrings anywhere:** modules, functions, classes, methods and properties all have empty `__doc__`.
-  Descriptions can only come from the API reference.
-- Runtime signatures carry C++ types (`std::vector< std::string,... > const &`, `ObjectSPtr< glef::EntityCollection >`),
-  readable after simplification (`[str]`, `EntityCollection`). Methods name their self parameter `target`.
-- Entity classes are SWIG classes in `glef`: `Part` has 57 `property` objects and 190 methods; its MRO is
-  `Part, Entity, IPhysical, ILocation, IDisplayable, IUserAttributes, IName, IPath, IActivatable`. The reference's
-  method index often says only "inherited by 404 classes", so inherited methods are matched through the runtime MRO.
+- No docstrings anywhere, so describe returns names, signatures and values only. Runtime signatures carry C++
+  types (`std::vector< std::string,... > const &`, `ObjectSPtr< glef::EntityCollection >`), readable after
+  simplification (`[str]`, `EntityCollection`). Methods name their self parameter `target`.
+- The reference's method index often says only "inherited by 404 classes", so a class's methods are listed
+  through its runtime MRO.
 - Property reads that can be expensive: `elements`, `nodes`, `...Entities`, `elementIDs`, `nodeCoordinates`,
   `elementConnectivities` (whole-model collections or arrays) are never read by describe. The 33 `IOrientation`
   properties (`orientation`, `alpha`, `euler123`, `xAxis` ...) are computed on every read, ~0.25 s each: 8.4 s for
   one solid, against 0.65 s for its other 57 properties. Some properties raise on read
   (`activeRep`: "only Adams Product support activating").
-- `apex.mesh` also defines classes for ~90 enums the reference documents under `apex.attribute` (separate
-  classes with the same names, `__module__ == "leaf.mesh"`).
-- `Part.colorRGB` is (112, 255, 184) on every part while `color` / `getColor()` give the displayed colour; it is not
-  the display colour.
 
 ## Undo
 
-- `apex.setting.getUndoRedoStackSize()` = **50**.
-- `apex.undo()` reverts, one command per step: part create, rename (`update(name=)`), `deleteEntities`,
-  `hide()`/`show()`, `update(color=)`. All verified.
-- **Works across bridge calls.** A bridge call is **not** grouped: two creates in one call need two undos.
-- `beginUndoIndent()` ... `endUndoIndent(description=)` makes everything in between **one** step
-  (verified with 2 creates and with 57 visibility toggles). Close it in `finally`.
-- **Visibility and colour changes are undo entries.** 56 ungrouped toggles pushed an older entry off the
-  50-entry stack. Grouping would keep the user's history, but undo history is not needed during MCP use (user
-  decision, 2026-11-13), so the scene tools do not group their changes.
-- Safe probing rule: after each `undo()` check the expected effect; if absent, `redo()` at once.
+Undo history is not kept during MCP use (user decision, 2026-11-13), so the scene tools do not group their
+changes. The undo measurements are in the skill's runtime-2024.1.md.
 
 ## Snapshot cost (for an effects receipt)
 
-On 3 parts / 4 assemblies, mean of 10: `list_tree` 13.6 ms (7.9 ms without counts),
-`list_connections` 22.5 ms, `list_loads_constraints` 1.5 ms, `list_catalog` 2.0 ms,
-`list_scenarios` 2.9 ms; pathNames plus solid/surface/mesh counts ~1.4 ms per assembly or part.
+On 3 parts / 4 assemblies, mean of 10, for what are now the sections of `model_overview`: parts 13.6 ms
+(7.9 ms without counts), connections 22.5 ms, loads and constraints 1.5 ms, catalog 2.0 ms, scenarios 2.9 ms; pathNames plus solid/surface/mesh counts ~1.4 ms per assembly or part.
 Extrapolated (not measured): ~1.5 s per snapshot at 1000 parts, before mesh element arrays.
 **Still to measure on a large meshed model.**
 

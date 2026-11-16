@@ -1,38 +1,21 @@
 """Live view of the `apex` API as this Apex actually has it (run on Apex's script thread).
 
-The generated API reference in the skills repo is right about most names but not all: Apex 2024.1
-has documented classes and enums under other modules or not at all, enum members the reference
-leaves out (`Undefined`), and 189 undocumented callables (see docs/apex-runtime-facts.md). The MCP
-server's preflight checks a script's apex names against this index, so it only blocks names that
-really are missing.
-
-api_index writes one JSON file and returns its path: the index is ~100 kB, too big for a reply.
+The generated API reference (apex-scripting skill, nastran-fea-skills) is right about most names
+but not all: Apex 2024.1 has documented classes and enums under other modules or not at all, enum
+members the reference leaves out (`Undefined`), and 189 undocumented callables (the skill's
+references/runtime-2024.1.md). Two things are built on what Apex itself reports:
+  describe        apex_describe: a module's names, a signature, enum values, an entity's properties;
+  failing_calls   which apex call raised in a script, with the signature Apex exposes for it.
 """
 import ast
 import difflib
 import inspect
-import json
-import os
 import re
 import time
 import types
 
 # apex.X attributes that are other Python modules imported into apex (os, sys, site, ...)
 _FOREIGN = ("os", "sys", "site", "abc", "io", "enum", "builtins", "ntpath", "stat", "xml", "smerge")
-
-
-def _params(fn):
-    """[(name, required)] of a Python-level signature, or None when it is (*args, **kwargs)."""
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return None
-    out = []
-    for p in sig.parameters.values():
-        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            return None
-        out.append([p.name, p.default is p.empty])
-    return out
 
 
 def enum_members(cls):
@@ -53,7 +36,7 @@ def enum_members(cls):
 
 
 def describe_module(mod):
-    rec = {"functions": {}, "classes": [], "enums": {}, "modules": [], "other": []}
+    rec = {"functions": [], "classes": [], "enums": {}, "modules": [], "other": []}
     for n in dir(mod):
         if n.startswith("_"):
             continue
@@ -72,7 +55,7 @@ def describe_module(mod):
             else:
                 rec["classes"].append(n)
         elif callable(v):
-            rec["functions"][n] = _params(v)
+            rec["functions"].append(n)
         else:
             rec["other"].append(n)
     return rec
@@ -93,48 +76,6 @@ def apex_modules(apex):
 def module_names(apex):
     """{runtime module __name__ ('leaf.mesh'): documented name ('apex.mesh')}."""
     return {m.__name__: name for name, m in apex_modules(apex).items()}
-
-
-def app_info(apex):
-    """getApplicationInfo() is a SWIG std::map: read it as a dict of strings."""
-    try:
-        app = apex.getApplicationInfo()
-    except Exception:
-        return {}
-    for read in (lambda: dict(app), lambda: {k: app[k] for k in app.keys()}):
-        try:
-            return {str(k): str(v) for k, v in read().items()}
-        except Exception:
-            pass
-    return {}
-
-
-def method_names(mods):
-    """Every public method name of the classes the apex modules define (Part.update, Camera.zoom,
-    ...), for the read-only check of query_apex_python. Properties are left out."""
-    seen, names = set(), set()
-    for m in mods.values():
-        for v in vars(m).values():
-            if not isinstance(v, type) or id(v) in seen:
-                continue
-            seen.add(id(v))
-            for n in dir(v):
-                if n.startswith("_") or n == "thisown":
-                    continue
-                try:
-                    raw = inspect.getattr_static(v, n)
-                except AttributeError:
-                    continue
-                if callable(raw) or isinstance(raw, (staticmethod, classmethod)):
-                    names.add(n)
-    return sorted(names)
-
-
-def build(apex):
-    mods = apex_modules(apex)
-    return {"format": 2, "application": app_info(apex),
-            "modules": {name: describe_module(m) for name, m in mods.items()},
-            "method_names": method_names(mods)}
 
 
 # ------------------------------------------------- which apex call failed (for run_apex_python)
@@ -161,9 +102,10 @@ def _lookup(frame, name):
 
 def describe_call(func_chain, frame, modmap):
     """Resolve a called name in the failing frame: {'name': 'apex.mesh.createSurfaceMesh',
-    'kind': 'function'} or {'name': 'Part.update', 'kind': 'method', 'class': 'Part',
-    'method': 'update'}; None if it is not an apex call. Only names and attribute reads are
-    evaluated (no calls), so resolving cannot change the model."""
+    'kind': 'function', 'signature': {...}} or {'name': 'Part.update', 'kind': 'method', 'class':
+    'Part', 'method': 'update', 'signature': {...}}; None if it is not an apex call. `signature` is
+    what Apex exposes (see signature()). Only names and attribute reads are evaluated (no calls),
+    so resolving cannot change the model."""
     found, obj = _lookup(frame, func_chain[0])
     if not found:
         return None
@@ -175,16 +117,19 @@ def describe_call(func_chain, frame, modmap):
     last = func_chain[-1]
     if len(func_chain) == 1:  # a bare name: a function imported from apex, or one of the script's own
         mod = modmap.get(getattr(obj, "__module__", None) or "")
-        return {"name": "%s.%s" % (mod, last), "kind": "function"} if mod else None
+        return {"name": "%s.%s" % (mod, last), "kind": "function", "signature": signature(obj)} if mod else None
     if isinstance(obj, types.ModuleType):
         mod = modmap.get(obj.__name__)
-        return {"name": "%s.%s" % (mod, last), "kind": "function"} if mod else None
+        fn = getattr(obj, last, None)
+        return {"name": "%s.%s" % (mod, last), "kind": "function",
+                "signature": signature(fn) if fn is not None else {"unknown": True}} if mod else None
     cls = obj if isinstance(obj, type) else type(obj)
     mod = modmap.get(getattr(cls, "__module__", "") or "")
     if not mod:
         return None
+    fn = inspect.getattr_static(cls, last, None)
     return {"name": "%s.%s" % (cls.__name__, last), "kind": "method", "class": cls.__name__, "method": last,
-            "module": mod, "bases": [c.__name__ for c in cls.__mro__[1:] if c is not object]}
+            "module": mod, "signature": signature(fn, method=True) if callable(fn) else {"unknown": True}}
 
 
 def tb_position(tb):
@@ -224,18 +169,6 @@ def failing_calls(code, lineno, frame, apex, position=None, limit=4):
         if len(out) >= limit:
             break
     return out
-
-
-def api_index(W, p):
-    apex = W.ensure_apex()
-    idx = build(apex)
-    path = os.path.join(W.out_dir("api"), "api_index.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(idx, fh, separators=(",", ":"))
-    mods = idx["modules"]
-    return {"path": path, "bytes": os.path.getsize(path), "modules": len(mods),
-            "functions": sum(len(m["functions"]) for m in mods.values()),
-            "enums": sum(len(m["enums"]) for m in mods.values())}
 
 
 # ------------------------------------------------------------------- apex_describe
@@ -385,7 +318,7 @@ def resolve(apex, target, ns=None, get_entity=None):
             return get_entity(target), None
         except Exception as exc:
             why = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc  # KeyError's str() adds quotes
-            raise NotFound("no entity %r (%s). Entity pathNames are as list_tree returns them." % (target, why))
+            raise NotFound("no entity %r (%s). Entity pathNames are as model_overview returns them." % (target, why))
     done = target.split(".")[0]
     for a in rest:
         if BIG_PROPERTY.search(a) and not isinstance(obj, (type, types.ModuleType)):
@@ -482,7 +415,6 @@ def describe(apex, target, flt=None, limit=200, values=True, budget_s=3.0, ns=No
         if is_method:
             cls = owner if isinstance(owner, type) else type(owner)
             out["owner"] = cls.__name__
-            out["owner_bases"] = [c.__name__ for c in cls.__mro__[1:] if c is not object]
         elif target.startswith("apex.") and isinstance(owner, types.ModuleType):
             out["module"] = target.rsplit(".", 1)[0]  # where it was asked for, not its runtime home ('leaf')
         else:
@@ -542,7 +474,7 @@ def m_describe(W, p):
     apex = W.ensure_apex()
     return describe(apex, p.get("target") or "apex", flt=p.get("filter"), limit=int(p.get("limit") or 200),
                     values=bool(p.get("values", True)), budget_s=float(p.get("budget_s") or 3.0),
-                    ns=W.STATE.get("ns"), get_entity=W.one_entity, ref=W.S.ref)
+                    ns=W.script_namespace(), get_entity=W.one_entity, ref=W.S.ref)
 
 
-TOOLS = {"api_index": api_index, "describe": m_describe}
+TOOLS = {"describe": m_describe}

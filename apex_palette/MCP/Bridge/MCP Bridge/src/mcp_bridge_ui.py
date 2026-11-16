@@ -165,13 +165,13 @@ def on_selftest(sender=None, args=None):
                 return
             res = r["result"]
             log("  Apex %s | model %s | units %s" % (
-                (res.get("application") or {}).get("release"), (res.get("model") or {}).get("name"),
+                (res.get("application") or {}).get("release"), res.get("model"),
                 res.get("script_units")))
-            r = dispatch({"id": "t2", "method": "list_tree", "params": {"counts": False}})
+            r = dispatch({"id": "t2", "method": "model_overview", "params": {"sections": ["parts"], "counts": False}})
             if r.get("ok"):
-                log("  top-level parts: %d" % len(r["result"].get("parts", [])))
+                log("  parts: %d" % len(r["result"].get("parts", [])))
             else:
-                log("  list_tree FAILED: %s" % r.get("error"))
+                log("  model_overview FAILED: %s" % r.get("error"))
             r = dispatch({"id": "t3", "method": "screenshot", "params": {"max_width": 800}})
             res = r.get("result") or {}
             shot = res.get("sheet") or ((res.get("views") or [{}])[0].get("path"))

@@ -1,6 +1,6 @@
-"""Scene/viewport/screenshot tests against the fake apex (no Apex needed): visibility and style are
-applied and put back, views and saved views, the capture guards (empty files, covered window) and
-the overlay crop. Run from the venv:  python tests\\test_scene.py
+"""Screenshot tests against the fake apex (no Apex needed): visibility and style are applied and
+put back (or left, with restore=False), views and saved views, the capture guards (empty files,
+covered window) and the overlay crop. Run from the venv:  python tests\\test_scene.py
 """
 import os
 import sys
@@ -31,7 +31,6 @@ def reset():
     cam.pos, cam.foc, cam.up, cam.scale, cam.calls = apex.Pt(10, 20, 30), apex.Pt(1, 2, 3), apex.Pt(0, 0, 1), 100.0, []
     apex.CAP["empty"] = 0
     apex.CALLS.clear()
-    apex.TEXTS.clear()
     vdir = SC.views_dir(W)
     for f in os.listdir(vdir):
         os.remove(os.path.join(vdir, f))
@@ -102,7 +101,7 @@ def test_restore_only_writes_what_changed_so_plain_parts_stay_visible():
     reset()
     call("screenshot", scene={"show_only": [PATH53]})
     assert P53.vis == "Visible" and P54.vis == "Visible", (P53.vis, P54.vis)  # not NotSet
-    call("screenshot", scene={"hide_all": True}, views=["iso1", "top"])
+    call("screenshot", scene={"hide": [PATH53, PATH54]}, views=["iso1", "top"])
     assert P53.vis == "Visible" and P54.vis == "Visible", (P53.vis, P54.vis)
     # no child was touched individually after the cascades, so none is written back one by one
     assert apex.Solid.writes and all(v in ("Visible", "Hidden") for _, v in apex.Solid.writes)
@@ -126,7 +125,7 @@ def test_assemblies_with_a_definite_state_are_put_back_and_notset_ones_left_alon
         assert a_all.vis == "Visible", "AsmAll was Visible and must come back Visible, not NotSet"
         assert a_mixed.vis == "NotSet" and P54._so[0].vis == "Hidden", (a_mixed.vis, P54._so[0].vis)
         assert P53.vis == "Visible"
-        call("screenshot", scene={"hide_all": True}, views=["iso1", "top"])  # also through the reference frame
+        call("screenshot", scene={"hide": [PATH53, PATH54]}, views=["iso1", "top"])  # also through the reference frame
         assert a_all.vis == "Visible" and a_mixed.vis == "NotSet", (a_all.vis, a_mixed.vis)
     finally:
         apex.ASSEMBLIES[:] = []
@@ -144,8 +143,7 @@ def test_the_reference_frame_does_not_leave_hidden_solids_visible():
 def test_style_is_applied_for_the_capture_and_restored():
     reset()
     with Spy() as spy:
-        r = call("screenshot", scene={"style": {"color_by_part": True, "render_style": "Shaded",
-                                                "transparency": {PATH53: 40}}})
+        r = call("screenshot", scene={"color_by_part": True, "render_style": "Shaded", "transparency": {PATH53: 40}})
     during = spy.seen[-1]
     assert during["colors"][PATH53] == SC.PALETTE[0] and during["colors"][PATH54] == SC.PALETTE[1], during
     assert during["render"] == "4"
@@ -154,14 +152,13 @@ def test_style_is_applied_for_the_capture_and_restored():
     assert r["warnings"] == [], r["warnings"]
 
 
-def test_viewport_keeps_the_scene():
+def test_restore_false_keeps_the_scene_and_the_view():
     reset()
-    r = call("viewport", scene={"show_only": [PATH54], "style": {"mesh_edges": False, "color": {PATH54: [1, 2, 3]}}},
-             view="front")
-    assert P53.vis == "Hidden" and P54.vis == "Visible" and P54.color == [1, 2, 3], (P53.vis, P54.color)
-    assert ("mesh_edges", False) in apex.CALLS and "camera" in r, (apex.CALLS, r)
-    assert apex.display.getCamera().calls[-1][:3] == ("fit", "y", True)  # front = camera on -Y
-    assert call("viewport")["camera"]["parallel_scale"] > 0  # nothing to do: reports the camera
+    r = call("screenshot", scene={"show_only": [PATH54], "mesh_edges": False, "color_by_part": True},
+             views=["front"], restore=False, crop="none")
+    assert P53.vis == "Hidden" and P54.vis == "Visible" and P54.color == SC.PALETTE[0], (P53.vis, P54.color)
+    assert ("mesh_edges", False) in apex.CALLS and r["restored"] is False and r["not_restored"] == [], (apex.CALLS, r)
+    assert ("fit", "y", True) in [c[:3] for c in apex.display.getCamera().calls]  # front = camera on -Y, left there
 
 
 def test_multi_view_sheet_and_camera_restore():
@@ -189,12 +186,14 @@ def test_bad_requests_change_nothing():
     assert P53.vis == "Visible" and cam_tuple() == before
     e = fails("screenshot", views=["sideways"])
     assert "unknown view 'sideways'" in e and "iso1" in e, e
-    assert "color" in fails("screenshot", scene={"style": {"color": {PATH54: [1, 2]}}})
-    assert "0-100" in fails("screenshot", scene={"style": {"transparency": {PATH54: 140}}})
-    assert "show_only cannot be combined" in fails("viewport", scene={"show_only": [PATH54], "show_all": True})
+    assert "0-100" in fails("screenshot", scene={"transparency": {PATH54: 140}})
+    assert "show_only cannot be combined" in fails("screenshot", scene={"show_only": [PATH54], "show_all": True})
     assert "at most 9" in fails("screenshot", views=["top"] * 10)
-    assert "Wireframe" in fails("screenshot", scene={"style": {"render_style": "Shiny"}})
-    assert "highlight needs" in fails("viewport", scene={"highlight": [{"color": [1, 2, 3]}]})
+    assert "Wireframe" in fails("screenshot", scene={"render_style": "Shiny"})
+    for old in ("highlight", "labels", "cut", "style", "hide_all"):  # removed: named, not silently ignored
+        e = fails("screenshot", scene={old: True})
+        assert "unknown scene key" in e and old in e and "show_only" in e, e
+    assert "view name" in fails("screenshot", save_view="bad/name", scene={"hide": [PATH53]})
     assert P53.vis == "Visible" and cam_tuple() == before and not apex.CALLS
 
 
@@ -212,31 +211,26 @@ def test_empty_capture_is_retried_and_then_reported():
 
 def test_saved_views_round_trip():
     reset()
-    r = call("viewport", view={"preset": "iso2", "zoom": 1.5}, save_view="Corner A")
-    saved = r["camera"]
-    assert "Corner A" in r["saved_views"]
-    call("viewport", view="top")
+    # the user sets a view up (here: a preset left in place), then it is saved as the camera stands
+    saved = call("screenshot", views=[{"preset": "iso2", "zoom": 1.5}], restore=False, crop="none")["views"][0]["camera"]
+    r = call("screenshot", save_view="Corner A", crop="none")
+    assert r["saved_views"] == ["Corner A"] and r["views"][0]["camera"] == saved, r
+    call("screenshot", views=["top"], restore=False, crop="none")
     assert cam_tuple()[-1] != saved["parallel_scale"]
     s = call("screenshot", views=[{"saved": "Corner A"}, "Corner A"], crop="none")
     assert s["views"][0]["camera"] == saved and s["views"][1]["camera"] == saved, (s["views"], saved)
-    assert call("viewport", list_views=True)["saved_views"].keys() == {"Corner A"}
-    assert "no saved view" in fails("screenshot", views=[{"saved": "nope"}])
-    assert "view name" in fails("viewport", save_view="bad/name")
-    assert call("viewport", delete_view="Corner A")["saved_views"] == {}
-    assert "no saved view" in fails("viewport", delete_view="Corner A")
+    # one call can save the current camera and use it
+    both = call("screenshot", save_view="Now", views=["Now", "iso1"], crop="none")
+    assert both["saved_views"] == ["Corner A", "Now"] and len(both["views"]) == 2, both
+    e = fails("screenshot", views=[{"saved": "nope"}])
+    assert "no saved view" in e and "Corner A" in e, e
 
 
 def test_things_without_readback_are_reported_not_silently_left():
     reset()
-    r = call("screenshot", crop="none", scene={
-        "style": {"mesh_edges": False}, "highlight": [{"paths": [PATH54]}],
-        "labels": [{"text": "hello", "at": [0, 0, 0]}], "cut": {"location": [1, 2, 3]}})
-    assert any("display toggles" in n for n in r["not_restored"]), r["not_restored"]
-    assert any("cut view" in n for n in r["not_restored"]), r["not_restored"]
-    assert apex.TEXTS == [], "labels we drew are removed again"
-    assert "clearHighlights" in apex.CALLS and ("displayCutViews", False) in apex.CALLS, apex.CALLS
-    kept = call("screenshot", crop="none", restore=False, scene={"labels": [{"text": "stay", "at": [0, 0, 0]}]})
-    assert kept["restored"] is False and len(apex.TEXTS) == 1
+    r = call("screenshot", crop="none", scene={"mesh_edges": False, "loads_bc_markers": True})
+    assert len(r["not_restored"]) == 1 and "display toggles" in r["not_restored"][0], r["not_restored"]
+    assert "mesh_edges" in r["not_restored"][0] and "loads_bc_markers" in r["not_restored"][0], r["not_restored"]
 
 
 def test_a_covered_window_is_raised_and_a_stuck_one_is_reported():
@@ -281,11 +275,10 @@ def test_model_box_ignores_small_stray_differences():
     assert SC.model_box(ref, Image.new("RGB", (10, 10))) is None
 
 
-def test_methods_are_registered_and_the_old_viewport_tools_are_gone():
-    assert {"viewport", "screenshot"} <= set(W.METHODS)
-    for gone in ("visibility", "set_view", "display_options", "highlight", "annotate", "cut_view"):
+def test_screenshot_is_the_only_view_method():
+    assert "screenshot" in W.METHODS
+    for gone in ("viewport", "visibility", "set_view", "display_options", "highlight", "annotate", "cut_view"):
         assert gone not in W.METHODS, gone
-    assert "apex_mcp/worker/scene.py" in W.DEPLOYED_FILES
 
 
 if __name__ == "__main__":
